@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+*.egg
+dist/
+build/
+*.so
+
+# Node
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.ntfs*
+
+# Environment
+.env
+.env.local
+.env.production
+
+# OS
+Thumbs.db
+.DS_Store
+Desktop.ini
+*.dll
+
+*.log
+
+# Database
+*.db
+*.sqlite
