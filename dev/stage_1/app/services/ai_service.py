@@ -224,6 +224,166 @@ async def expand_query_for_search(query: str, db) -> str | None:
     logger.error("Query expansion FAILED after %d attempts: %s — %r", _MAX_RETRIES, last_error, query)
     return None
 
+async def select_law_article_llm(
+    situation: str,
+    law_list: list[tuple[int, str, str | None, str]],
+) -> dict:
+    headers = {"Content-Type": "application/json"}
+    if settings.openai_api_key and settings.openai_api_key != "not-needed":
+        headers["Authorization"] = f"Bearer {settings.openai_api_key}"
+
+    laws_text = "\n".join(
+        f"{i+1}. {title} (№{num}) [{cat}]" if num else f"{i+1}. {title} [{cat}]"
+        for i, (_, title, num, cat) in enumerate(law_list)
+    )
+
+    prompt = f"""Ситуация пользователя: {situation}
+
+Список доступных законов РК (выбери ТОЛЬКО из этого списка):
+{laws_text}"""
+
+    models_to_try = [settings.openai_model] + _FALLBACK_MODELS
+
+    for model in models_to_try:
+        for attempt in range(2):
+            try:
+                async with httpx.AsyncClient(timeout=settings.openai_timeout, verify=False) as client:
+                    payload = {
+                        "model": model,
+                        "messages": [
+                            {"role": "system", "content": SELECTION_SYSTEM_PROMPT},
+                            {"role": "user", "content": prompt},
+                        ],
+                        "temperature": 0.1,
+                        "max_tokens": 512,
+                    }
+                    if model != settings.openai_model:
+                        payload["provider"] = "auto"
+
+                    resp = await client.post(
+                        f"{settings.openai_base_url}/chat/completions",
+                        json=payload,
+                        headers=headers,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    content = data["choices"][0]["message"]["content"]
+
+                    json_match = re.search(r"\{.*\}", content, re.DOTALL)
+                    if json_match:
+                        obj = json.loads(json_match.group())
+                        law_title = obj.get("law_title") or ""
+                        article_number = str(obj.get("article_number") or "")
+                        confidence = int(obj.get("confidence", 0))
+                        reasoning = obj.get("reasoning", "")
+                        return {
+                            "law_title": law_title.strip(),
+                            "article_number": article_number.strip(),
+                            "confidence": min(max(confidence, 0), 100),
+                            "reasoning": reasoning.strip(),
+                        }
+            except Exception as e:
+                logger.warning("Law selection model %s attempt %d: %s", model, attempt + 1, e)
+                await asyncio.sleep(0.5)
+
+    return {"law_title": "", "article_number": "", "confidence": 0, "reasoning": ""}
+
+
+async def generate_control_question(
+    situation: str,
+    law_title: str,
+    article_number: str,
+    article_content: str,
+) -> str:
+    headers = {"Content-Type": "application/json"}
+    if settings.openai_api_key and settings.openai_api_key != "not-needed":
+        headers["Authorization"] = f"Bearer {settings.openai_api_key}"
+
+    prompt = f"""Ситуация пользователя: {situation}
+
+Выбранный закон: {law_title}
+Статья №{article_number}
+Содержание статьи: {article_content[:1500]}"""
+
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=settings.openai_timeout, verify=False) as client:
+                payload = {
+                    "model": settings.openai_model,
+                    "messages": [
+                        {"role": "system", "content": CONTROL_QUESTION_PROMPT},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": 0.3,
+                    "max_tokens": 256,
+                }
+                resp = await client.post(
+                    f"{settings.openai_base_url}/chat/completions",
+                    json=payload,
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                content = data["choices"][0]["message"]["content"]
+
+                json_match = re.search(r"\{.*\}", content, re.DOTALL)
+                if json_match:
+                    obj = json.loads(json_match.group())
+                    q = obj.get("control_question", "")
+                    if q:
+                        return q.strip()
+        except Exception as e:
+            logger.warning("Control question attempt %d failed: %s", attempt + 1, e)
+            if attempt < 2:
+                await asyncio.sleep(1)
+
+    return ""
+
+
+COVE_EXTRACT_PROMPT = """Ты — юрист-аналитик. Из данного юридического заключения выдели все фактические утверждения, которые можно проверить по исходным статьям законов.
+
+Каждое утверждение переформулируй как вопрос с ответом ДА/НЕТ.
+
+Верни ТОЛЬКО JSON:
+{
+  "claims": [
+    {
+      "question": "Вопрос, который можно проверить по тексту статей",
+      "expected": "ДА или НЕТ — какой ответ ожидается в заключении"
+    }
+  ]
+}
+
+Пример:
+Заключение: «Статья 10 ЗоЗПП дает право на возврат товара в течение 14 дней»
+→ {"question": "Верно ли, что статья 10 ЗоЗПП дает право на возврат товара?", "expected": "ДА"}"""
+
+
+COVE_VERIFY_PROMPT = """Ты — строгий эксперт по законам РК. Ответь на вопрос, используя ТОЛЬКО текст предоставленных статей.
+
+Верни ТОЛЬКО JSON:
+{
+  "answer": "ДА или НЕТ",
+  "evidence": "Цитата из статьи, подтверждающая ответ (или null если нет подтверждения)",
+  "confidence": 0-100
+}
+
+Правила:
+- Если в статье нет информации для ответа — answer: "НЕТ", evidence: null
+- Не используй свои знания — только текст статей"""
+
+
+COVE_REVISE_PROMPT = """Ты — юрист РК. Перепиши своё заключение, исправив все ошибки, найденные при проверке.
+
+Исходное заключение содержало ошибки. Исправленный вариант должен опираться ТОЛЬКО на подтверждённые факты.
+
+Формат:
+**Ответ:** ...
+**Что делать:** ...
+**Нормы:** [закон, статья] — суть
+**Контрольный вопрос:** <уточняющий вопрос>"""
+
+
 LEGAL_SYSTEM_PROMPT = """Ты — юрист РК. Используй ТОЛЬКО законы из списка ниже.
 
 ПРАВИЛА:
@@ -238,6 +398,37 @@ LEGAL_SYSTEM_PROMPT = """Ты — юрист РК. Используй ТОЛЬК
 **Ответ:** ...
 **Что делать:** ...
 **Нормы:** [название закона из списка, статья] — суть"""
+
+
+SELECTION_SYSTEM_PROMPT = """Ты — юрист-эксперт Республики Казахстан.
+Твоя задача — по бытовому описанию ситуации определить, какой закон РК и какая статья наиболее применимы.
+
+Верни ТОЛЬКО JSON без пояснений:
+{
+  "law_title": "Точное название закона из списка",
+  "article_number": "Номер статьи",
+  "confidence": 0-100,
+  "reasoning": "Краткое обоснование (1-2 предложения)"
+}
+
+Правила:
+- Выбирай ТОЛЬКО из предоставленного списка законов
+- confidence = насколько ты уверен, что эта статья подходит (0-100)
+- Если ни один закон не подходит — law_title: null, article_number: null, confidence: 0
+- Не выдумывай законы и статьи"""
+
+
+CONTROL_QUESTION_PROMPT = """Ты — юрист РК. На основе ситуации пользователя и выбранного закона/статьи задай 1 уточняющий вопрос.
+
+Вопрос должен помочь подтвердить, что эта статья действительно применима к ситуации.
+Верни ТОЛЬКО JSON:
+{
+  "control_question": "твой уточняющий вопрос пользователю"
+}
+
+Правила:
+- Вопрос должен быть конкретным и по делу
+- Не добавляй лишнего текста, только JSON"""
 
 
 async def generate_legal_analysis(situation: str, pairs: list) -> str:
@@ -256,12 +447,211 @@ async def generate_legal_analysis(situation: str, pairs: list) -> str:
 {all_law_names}
 
 Релевантные статьи из этих законов:
-{articles_text}"""
+{articles_text}
+
+После анализа задай 1 короткий уточняющий вопрос пользователю в формате:
+**Контрольный вопрос:** <текст вопроса>"""
 
     if settings.ai_provider == "openai":
         return await _call_openai(situation, user_prompt, pairs)
     else:
         return await _call_ollama(situation, user_prompt) or _fallback_analysis(situation, pairs)
+
+
+def _extract_control_question(analysis: str) -> str | None:
+    m = re.search(r'\*\*Контрольный вопрос\*\*:\s*(.+?)(?:\n|$)', analysis, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r'(?:Контрольный вопрос|Уточняющий вопрос|Вопрос)[:\s]\s*(.+?)(?:\n|$)', analysis, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+async def _cove_extract_claims(analysis: str) -> list[dict]:
+    headers = {"Content-Type": "application/json"}
+    if settings.openai_api_key and settings.openai_api_key != "not-needed":
+        headers["Authorization"] = f"Bearer {settings.openai_api_key}"
+
+    prompt = f"""Юридическое заключение:
+{analysis}"""
+
+    models_to_try = [settings.openai_model] + _FALLBACK_MODELS
+    for model in models_to_try:
+        for attempt in range(2):
+            try:
+                async with httpx.AsyncClient(timeout=settings.openai_timeout, verify=False) as client:
+                    payload = {
+                        "model": model,
+                        "messages": [
+                            {"role": "system", "content": COVE_EXTRACT_PROMPT},
+                            {"role": "user", "content": prompt},
+                        ],
+                        "temperature": 0.0,
+                        "max_tokens": 512,
+                    }
+                    if model != settings.openai_model:
+                        payload["provider"] = "auto"
+                    resp = await client.post(
+                        f"{settings.openai_base_url}/chat/completions",
+                        json=payload, headers=headers,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    content = data["choices"][0]["message"]["content"]
+                    json_match = re.search(r"\{.*\}", content, re.DOTALL)
+                    if json_match:
+                        obj = json.loads(json_match.group())
+                        claims = obj.get("claims", [])
+                        if claims:
+                            return claims
+            except Exception as e:
+                logger.warning("CoVe extract claims %s attempt %d: %s", model, attempt + 1, e)
+                await asyncio.sleep(0.5)
+    return []
+
+
+async def _cove_verify_one(question: str, articles_text: str) -> dict:
+    headers = {"Content-Type": "application/json"}
+    if settings.openai_api_key and settings.openai_api_key != "not-needed":
+        headers["Authorization"] = f"Bearer {settings.openai_api_key}"
+
+    prompt = f"""Статьи законов для проверки:
+{articles_text}
+
+Вопрос: {question}"""
+
+    models_to_try = [settings.openai_model] + _FALLBACK_MODELS
+    for model in models_to_try:
+        for attempt in range(2):
+            try:
+                async with httpx.AsyncClient(timeout=settings.openai_timeout, verify=False) as client:
+                    payload = {
+                        "model": model,
+                        "messages": [
+                            {"role": "system", "content": COVE_VERIFY_PROMPT},
+                            {"role": "user", "content": prompt},
+                        ],
+                        "temperature": 0.0,
+                        "max_tokens": 256,
+                    }
+                    if model != settings.openai_model:
+                        payload["provider"] = "auto"
+                    resp = await client.post(
+                        f"{settings.openai_base_url}/chat/completions",
+                        json=payload, headers=headers,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    content = data["choices"][0]["message"]["content"]
+                    json_match = re.search(r"\{.*\}", content, re.DOTALL)
+                    if json_match:
+                        obj = json.loads(json_match.group())
+                        return {
+                            "answer": obj.get("answer", "НЕТ"),
+                            "evidence": obj.get("evidence"),
+                            "confidence": int(obj.get("confidence", 0)),
+                        }
+            except Exception as e:
+                logger.warning("CoVe verify %s attempt %d: %s", model, attempt + 1, e)
+                await asyncio.sleep(0.5)
+    return {"answer": "НЕТ", "evidence": None, "confidence": 0}
+
+
+async def _cove_revise(situation: str, analysis: str, verification_log: list[dict], pairs: list) -> tuple[str, int]:
+    headers = {"Content-Type": "application/json"}
+    if settings.openai_api_key and settings.openai_api_key != "not-needed":
+        headers["Authorization"] = f"Bearer {settings.openai_api_key}"
+
+    log_text = "\n".join(
+        f"Утверждение: {v.get('question', '')}\nПроверка: {v.get('answer', 'НЕТ')}\nДоказательство: {v.get('evidence', 'нет')}\n"
+        for v in verification_log
+    )
+    failed = sum(1 for v in verification_log if v.get("answer") == "НЕТ")
+    confidence = max(0, 100 - (failed * 100 // max(len(verification_log), 1)))
+
+    if failed == 0:
+        return analysis, 100
+
+    articles_text = _format_articles_for_prompt(pairs) if pairs else "Нет статей"
+    prompt = f"""Ситуация пользователя: {situation}
+
+Исходное заключение (содержит ошибки):
+{analysis}
+
+Результаты проверки фактов:
+{log_text}
+
+Доступные статьи:
+{articles_text}
+
+Исправь заключение: убери ошибочные утверждения, оставь только подтверждённые факты."""
+
+    models_to_try = [settings.openai_model] + _FALLBACK_MODELS
+    for model in models_to_try:
+        for attempt in range(2):
+            try:
+                async with httpx.AsyncClient(timeout=settings.openai_timeout, verify=False) as client:
+                    payload = {
+                        "model": model,
+                        "messages": [
+                            {"role": "system", "content": COVE_REVISE_PROMPT},
+                            {"role": "user", "content": prompt},
+                        ],
+                        "temperature": 0.2,
+                        "max_tokens": 1536,
+                    }
+                    if model != settings.openai_model:
+                        payload["provider"] = "auto"
+                    resp = await client.post(
+                        f"{settings.openai_base_url}/chat/completions",
+                        json=payload, headers=headers,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    revised = data["choices"][0]["message"]["content"].strip()
+                    if revised and len(revised) > 50:
+                        return revised, confidence
+            except Exception as e:
+                logger.warning("CoVe revise %s attempt %d: %s", model, attempt + 1, e)
+                await asyncio.sleep(0.5)
+    return analysis, confidence
+
+
+async def cove_verify(
+    situation: str,
+    analysis: str,
+    pairs: list,
+) -> dict:
+    if not analysis or not pairs:
+        return {"analysis": analysis, "confidence": 0, "errors": []}
+
+    articles_text = _format_articles_for_prompt(pairs)
+
+    claims = await _cove_extract_claims(analysis)
+    if not claims:
+        logger.warning("CoVe: no claims extracted from analysis")
+        return {"analysis": analysis, "confidence": 50, "errors": []}
+
+    verification_log = []
+    for claim in claims:
+        result = await _cove_verify_one(claim["question"], articles_text)
+        verification_log.append({
+            "question": claim["question"],
+            "expected": claim.get("expected", "ДА"),
+            "answer": result["answer"],
+            "evidence": result["evidence"],
+            "confidence": result["confidence"],
+        })
+
+    errors = [v for v in verification_log if v["answer"] != v["expected"]]
+    revised_analysis, revised_confidence = await _cove_revise(situation, analysis, verification_log, pairs)
+
+    return {
+        "analysis": revised_analysis,
+        "confidence": revised_confidence,
+        "errors": [{"claim": e["question"], "expected": e["expected"], "actual": e["answer"]} for e in errors],
+    }
 
 
 async def _call_ollama(situation: str, user_prompt: str) -> str | None:

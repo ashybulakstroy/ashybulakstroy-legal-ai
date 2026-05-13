@@ -14,13 +14,17 @@ from sqlalchemy.orm import selectinload
 
 from app.config import settings
 from app.database import get_db
-from app.models.legislation import Law, SearchCache
+from app.models.legislation import Law, Article, LawStatus, SearchCache
 from app.schemas.legislation import (
     CategoryResponse, CategoryTree, LawResponse, SearchResult,
     LegalAdviceRequest, LegalAdviceResponse,
 )
 from app.services.legislation_service import LegislationService
-from app.services.ai_service import generate_legal_analysis, expand_query_for_search
+from app.services.ai_service import (
+    generate_legal_analysis, expand_query_for_search,
+    select_law_article_llm, _extract_control_question,
+    cove_verify,
+)
 
 router = APIRouter(prefix="/api/v1", tags=["Законодательство РК"])
 
@@ -159,20 +163,67 @@ async def legal_advice(
 
     pairs = None
     expanded_query = None
+    llm_selection = None
+    confidence = 0
 
-    if not req.refresh:
-        pairs = await _load_cached_pairs(search_text, service.db, service)
+    if req.search_method == "llm":
+        laws_result = await service.db.execute(
+            select(Law).options(selectinload(Law.category)).where(
+                Law.status.in_([LawStatus.ACTIVE, LawStatus.AMENDED])
+            )
+        )
+        all_laws = list(laws_result.scalars().all())
+        law_list = [
+            (law.id, law.title, law.number, law.category.name if law.category else "")
+            for law in all_laws
+        ]
 
-    if pairs is None:
-        pairs = await service.find_relevant_articles(search_text)
+        llm_selection = await select_law_article_llm(search_text, law_list)
+        confidence = llm_selection.get("confidence", 0)
 
-        if not pairs and req.search_method == "auto":
-            expanded_query = await expand_query_for_search(search_text, service.db)
-            if expanded_query:
-                pairs = await service.find_relevant_articles(expanded_query)
+        if llm_selection.get("law_title") and confidence >= 30:
+            selected_law = None
+            for law in all_laws:
+                if law.title == llm_selection["law_title"]:
+                    selected_law = law
+                    break
+            if selected_law:
+                articles_stmt = select(Article).where(
+                    Article.law_id == selected_law.id
+                ).order_by(Article.sort_order)
+                articles_result = await service.db.execute(articles_stmt)
+                all_articles = list(articles_result.scalars().all())
 
-        if pairs:
-            await _save_cached_pairs(search_text, pairs, service.db)
+                article_num = llm_selection.get("article_number", "")
+                selected_articles = []
+                if article_num:
+                    for art in all_articles:
+                        if art.number and art.number.strip() == article_num.strip():
+                            selected_articles = [art]
+                            break
+                if not selected_articles and all_articles:
+                    selected_articles = all_articles[:3]
+
+                if selected_articles:
+                    pairs = [(selected_law, selected_articles)]
+
+        if not pairs:
+            pairs = await service.find_relevant_articles(search_text)
+
+    else:
+        if not req.refresh:
+            pairs = await _load_cached_pairs(search_text, service.db, service)
+
+        if pairs is None:
+            pairs = await service.find_relevant_articles(search_text)
+
+            if not pairs and req.search_method == "auto":
+                expanded_query = await expand_query_for_search(search_text, service.db)
+                if expanded_query:
+                    pairs = await service.find_relevant_articles(expanded_query)
+
+            if pairs:
+                await _save_cached_pairs(search_text, pairs, service.db)
 
     results = []
     article_excerpts = []
@@ -196,7 +247,21 @@ async def legal_advice(
                 law_id=law.id,
                 law_title=law.title,
             ))
+    control_question = None
     analysis = await generate_legal_analysis(search_text, pairs)
+    if analysis:
+        control_question = _extract_control_question(analysis)
+
+    verification = await cove_verify(search_text, analysis, pairs)
+    if verification.get("analysis"):
+        analysis = verification["analysis"]
+        control_question = _extract_control_question(analysis) or control_question
+    if verification.get("confidence", 0) > 0:
+        confidence = verification["confidence"]
+
+    if analysis and confidence > 0:
+        analysis = analysis.replace("**Ответ:** ", f"**Ответ:** [{confidence}%] ", 1)
+
     refinement_hint = None
     if not pairs:
         if expanded_query:
@@ -245,6 +310,8 @@ async def legal_advice(
         analysis=analysis,
         expanded_query=expanded_query,
         refinement_hint=refinement_hint,
+        confidence=confidence,
+        control_question=control_question,
     )
 
 
@@ -351,32 +418,59 @@ async def legal_advice_stream(req: LegalAdviceRequest):
 
                 pairs = None
                 expanded_query = None
+                confidence = 0
 
-                # Step 1: Check cache
-                yield _sse_progress(5, "Проверка кеша...")
-                if not req.refresh:
-                    pairs = await _load_cached_pairs(search_text, db, service)
+                if req.search_method == "llm":
+                    yield _sse_progress(10, "Выбор закона через нейросеть...")
+                    laws_result = await db.execute(
+                        select(Law).options(selectinload(Law.category)).where(
+                            Law.status.in_([LawStatus.ACTIVE, LawStatus.AMENDED])
+                        )
+                    )
+                    all_laws = list(laws_result.scalars().all())
+                    law_list = [
+                        (law.id, law.title, law.number, law.category.name if law.category else "")
+                        for law in all_laws
+                    ]
+                    llm_selection = await select_law_article_llm(search_text, law_list)
+                    confidence = llm_selection.get("confidence", 0)
 
-                if pairs is None:
-                    # Step 2: Search laws in DB
+                    if llm_selection.get("law_title") and confidence >= 30:
+                        selected_law = next((law for law in all_laws if law.title == llm_selection["law_title"]), None)
+                        if selected_law:
+                            articles_result = await db.execute(
+                                select(Article).where(Article.law_id == selected_law.id).order_by(Article.sort_order)
+                            )
+                            all_articles = list(articles_result.scalars().all())
+                            article_num = llm_selection.get("article_number", "")
+                            selected_articles = []
+                            if article_num:
+                                selected_articles = [a for a in all_articles if a.number and a.number.strip() == article_num.strip()]
+                            if not selected_articles and all_articles:
+                                selected_articles = all_articles[:3]
+                            if selected_articles:
+                                pairs = [(selected_law, selected_articles)]
+                                yield _sse_progress(30, f"Выбран закон: {selected_law.title}")
+
+                    if not pairs:
+                        yield _sse_progress(15, "Поиск релевантных статей в БД...")
+                        pairs = await service.find_relevant_articles(search_text)
+                else:
                     yield _sse_progress(10, "Поиск релевантных статей в БД...")
-                    pairs = await service.find_relevant_articles(search_text)
+                    if not req.refresh:
+                        pairs = await _load_cached_pairs(search_text, db, service)
+                    if pairs is None:
+                        pairs = await service.find_relevant_articles(search_text)
+                        if not pairs and req.search_method == "auto":
+                            yield _sse_progress(20, "Расширение запроса через нейросеть...")
+                            expanded_query = await expand_query_for_search(search_text, db)
+                            if expanded_query:
+                                yield _sse_progress(25, "Повторный поиск...")
+                                pairs = await service.find_relevant_articles(expanded_query)
+                        if pairs:
+                            await _save_cached_pairs(search_text, pairs, db)
 
-                    # Step 3: Expand query via LLM if nothing found
-                    if not pairs and req.search_method == "auto":
-                        yield _sse_progress(20, "Расширение запроса через нейросеть...")
-                        expanded_query = await expand_query_for_search(search_text, db)
-                        if expanded_query:
-                            yield _sse_progress(25, "Повторный поиск с расширенным запросом...")
-                            pairs = await service.find_relevant_articles(expanded_query)
-
-                    # Step 4: Save cache
-                    if pairs:
-                        yield _sse_progress(30, "Сохранение результатов в кеш...")
-                        await _save_cached_pairs(search_text, pairs, db)
-
-                # Step 5: Build result structures
-                yield _sse_progress(35, "Формирование списка законов и статей...")
+                yield _sse_progress(40, "Формирование списка законов и статей...")
                 results = []
                 article_excerpts = []
                 for law, articles in pairs:
@@ -393,25 +487,32 @@ async def legal_advice_stream(req: LegalAdviceRequest):
                             content=art.content, law_id=law.id, law_title=law.title,
                         ))
 
-                # Step 6: LLM analysis
-                yield _sse_progress(40, "Анализ ситуации через нейросеть...")
+                yield _sse_progress(50, "Анализ ситуации через нейросеть...")
+                control_question = None
                 analysis = await generate_legal_analysis(search_text, pairs)
+                if analysis:
+                    control_question = _extract_control_question(analysis)
 
-                # Step 7: Build refinement hint + filter cited articles
+                yield _sse_progress(75, "Проверка фактов (самопроверка)...")
+                verification = await cove_verify(search_text, analysis, pairs)
+                if verification.get("analysis"):
+                    analysis = verification["analysis"]
+                    control_question = _extract_control_question(analysis) or control_question
+                if verification.get("confidence", 0) > 0:
+                    confidence = verification["confidence"]
+
                 yield _sse_progress(90, "Фильтрация цитированных статей...")
                 refinement_hint = None
                 if not pairs:
                     if expanded_query:
                         refinement_hint = (
                             "По вашему запросу ничего не найдено даже после расширения. "
-                            "Попробуйте переформулировать — добавьте больше деталей: "
-                            "что именно произошло, с кем, где."
+                            "Попробуйте переформулировать."
                         )
                     else:
                         refinement_hint = (
                             "По вашему запросу ничего не найдено. "
-                            "Попробуйте добавить контекст или использовать юридические термины "
-                            "(например, «недостаток товара» вместо «сломался»)."
+                            "Попробуйте добавить контекст."
                         )
 
                 if analysis and article_excerpts:
@@ -423,9 +524,7 @@ async def legal_advice_stream(req: LegalAdviceRequest):
                         raw = m.group(1)
                         for part in re.findall(r'\d+(?:-\d+)?', raw):
                             cited_nums.add(part)
-                    if not cited_nums:
-                        article_excerpts = []
-                    else:
+                    if cited_nums:
                         filtered = []
                         for a in article_excerpts:
                             art_num = str(a.number or '').strip()
@@ -438,9 +537,10 @@ async def legal_advice_stream(req: LegalAdviceRequest):
                             if base and base.group(1) in cited_nums:
                                 filtered.append(a)
                         article_excerpts = filtered
+                    else:
+                        article_excerpts = []
 
-                # Step 8: Finalize
-                yield _sse_progress(100, "Подготовка ответа...")
+                yield _sse_progress(100, "Готово")
 
                 result = LegalAdviceResponse(
                     situation=req.situation,
@@ -449,6 +549,8 @@ async def legal_advice_stream(req: LegalAdviceRequest):
                     analysis=analysis,
                     expanded_query=expanded_query,
                     refinement_hint=refinement_hint,
+                    confidence=confidence,
+                    control_question=control_question,
                 )
 
                 yield _sse_event("result", result.model_dump(mode="json"))

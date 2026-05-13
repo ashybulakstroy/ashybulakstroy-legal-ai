@@ -1,6 +1,6 @@
 param($Action = "start")
 $port = 8000
-$python = "C:\Work\Prj_24_LAW_KZ\.venv\Scripts\python.exe"
+$python = "C:\Work\Prj_2_Legal_AI\.venv\Scripts\python.exe"
 $workdir = $PSScriptRoot
 
 function Get-ProcessOnPort($port) {
@@ -27,6 +27,7 @@ Start-Sleep -Seconds 1
 $cleanPath = ($env:PATH -split ';' | Where-Object { $_ -notlike '*Prj_21_Odoo*' }) -join ';'
 $env:PATH = "$(Split-Path $python);$cleanPath"
 
+$env:PYTHONPATH = $workdir
 $args = "-m uvicorn app.main:app --host 0.0.0.0 --port $port --log-level error"
 $proc = Start-Process -FilePath $python -ArgumentList $args -WorkingDirectory $workdir -WindowStyle Hidden -PassThru
 "Server started on port $port (PID: $($proc.Id))"

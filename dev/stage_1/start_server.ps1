@@ -1,4 +1,5 @@
-$python = "C:\Work\Prj_24_LAW_KZ\.venv\Scripts\python.exe"
+$python = "C:\Work\Prj_2_Legal_AI\.venv\Scripts\python.exe"
 $workdir = $PSScriptRoot
+$env:PYTHONPATH = $workdir
 Set-Location $workdir
 & $python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --log-level warning

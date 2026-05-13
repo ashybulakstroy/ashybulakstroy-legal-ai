@@ -84,8 +84,15 @@ class ArticleExcerpt(BaseModel):
 class LegalAdviceRequest(BaseModel):
     situation: str
     context: str | None = None
-    search_method: str = "auto"
+    search_method: str = "llm"
     refresh: bool = False
+
+
+class SelectionResult(BaseModel):
+    law_title: str | None = None
+    article_number: str | None = None
+    confidence: int = 0
+    reasoning: str | None = None
 
 
 class LegalAdviceResponse(BaseModel):
@@ -95,4 +102,6 @@ class LegalAdviceResponse(BaseModel):
     analysis: str
     expanded_query: str | None = None
     refinement_hint: str | None = None
+    confidence: int = 0
+    control_question: str | None = None
     disclaimer: str = "Данная информация носит справочный характер. Для получения официальной консультации обратитесь к квалифицированному юристу."

@@ -368,12 +368,33 @@ function showProgress(percent, message) {
     }).join('');
 }
 
+function confidenceColor(val) {
+    if (val >= 75) return '#16a34a';
+    if (val >= 50) return '#2563eb';
+    if (val >= 25) return '#ca8a04';
+    return '#dc2626';
+}
+
 function showResult(data, situation) {
     document.getElementById('advice-progress').style.display = 'none';
     const results = document.getElementById('advice-results');
 
     let html = '<div class="advice-box">';
+    if (data.confidence !== undefined && data.confidence !== null) {
+        var pct = data.confidence;
+        var color = confidenceColor(pct);
+        html += '<div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;padding:8px 12px;background:' + color + '15;border-radius:8px;border-left:4px solid ' + color + '">';
+        html += '<div style="font-size:1.5em;font-weight:700;color:' + color + '">' + pct + '%</div>';
+        html += '<div style="font-size:0.85em;color:' + color + '">уверенность ответа</div>';
+        html += '</div>';
+    }
     html += '<div class="analysis"><pre style="white-space:pre-wrap;font-family:inherit;margin:0">' + (data.analysis || '') + '</pre></div>';
+    if (data.control_question) {
+        html += '<div style="margin-top:16px;padding:12px;background:#f0f9ff;border-radius:8px;border-left:4px solid #1a56db">';
+        html += '<div style="font-weight:600;font-size:0.9em;color:#1a56db;margin-bottom:4px">✋ Уточняющий вопрос</div>';
+        html += '<div style="font-size:0.95em">' + data.control_question.replace(/^\*\*/g,'').replace(/\*\*$/g,'') + '</div>';
+        html += '</div>';
+    }
 
     if (data.relevant_articles && data.relevant_articles.length > 0) {
         html += '<details open style="margin-top:16px"><summary style="cursor:pointer;font-weight:bold">📄 Применимые статьи (' + data.relevant_articles.length + ')</summary>';
