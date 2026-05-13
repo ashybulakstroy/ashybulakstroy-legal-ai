@@ -1,6 +1,6 @@
 from datetime import date, datetime
 
-from sqlalchemy import ForeignKey, Integer, String, Text, Date, DateTime, Enum as SAEnum
+from sqlalchemy import ForeignKey, Integer, String, Text, Date, DateTime, Boolean, Enum as SAEnum
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -80,6 +80,7 @@ class Article(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     law: Mapped["Law"] = relationship("Law", back_populates="articles")
+    conditions: Mapped[list["ArticleCondition"]] = relationship("ArticleCondition", back_populates="article", cascade="all, delete-orphan")
 
     def __repr__(self) -> str:
         return f"<Article {self.law_id}.{self.number}>"
@@ -97,6 +98,22 @@ class QueryExpansionCache(Base):
         return f"<QueryExpansionCache {self.original_query!r} -> {self.expanded_query!r}>"
 
 
+class ArticleCondition(Base):
+    __tablename__ = "article_conditions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    article_id: Mapped[int] = mapped_column(Integer, ForeignKey("articles.id"), nullable=False)
+    condition_text: Mapped[str] = mapped_column(String(500), nullable=False)
+    condition_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    is_required: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    article: Mapped["Article"] = relationship("Article", back_populates="conditions")
+
+    def __repr__(self) -> str:
+        return f"<ArticleCondition #{self.id}: {self.condition_text[:60]}>"
+
+
 class SearchCache(Base):
     __tablename__ = "search_cache"
 
@@ -108,3 +125,30 @@ class SearchCache(Base):
 
     def __repr__(self) -> str:
         return f"<SearchCache {self.search_text!r} (v{self.cache_version})>"
+
+
+class LegalAdviceLog(Base):
+    __tablename__ = "legal_advice_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+    situation: Mapped[str] = mapped_column(Text, nullable=False)
+    client_type: Mapped[str] = mapped_column(String(50), default="forms")
+    search_method: Mapped[str] = mapped_column(String(10), default="auto")
+    endpoint: Mapped[str] = mapped_column(String(20), nullable=False, default="consult")
+
+    status: Mapped[str] = mapped_column(String(10), default="PASS")
+    completeness: Mapped[int] = mapped_column(Integer, default=100)
+    confidence: Mapped[int] = mapped_column(Integer, default=0)
+
+    matched_laws: Mapped[str | None] = mapped_column(Text, nullable=True)
+    matched_categories: Mapped[str | None] = mapped_column(Text, nullable=True)
+    matched_articles_count: Mapped[int] = mapped_column(Integer, default=0)
+
+    analysis_length: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    had_expanded_query: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self) -> str:
+        return f"<LegalAdviceLog #{self.id} [{self.status}] {self.endpoint}>"

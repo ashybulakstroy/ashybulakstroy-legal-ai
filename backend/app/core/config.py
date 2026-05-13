@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     LLM_PROVIDER: str = "openai"
     LLM_API_KEY: Optional[str] = None
     LLM_MODEL: str = "gpt-4o"
+    LLM_BASE_URL: Optional[str] = None
+    LLM_TIMEOUT: int = 60
 
     MCP_SERVER_HOST: str = "0.0.0.0"
     MCP_SERVER_PORT: int = 8100

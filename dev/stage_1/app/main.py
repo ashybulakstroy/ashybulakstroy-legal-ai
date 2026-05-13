@@ -31,6 +31,12 @@ _jinja_env = Environment(
 async def lifespan(app: FastAPI):
     logger.info("Starting Law KZ MCP Server...")
     async with engine.begin() as conn:
+        from sqlalchemy import text as sa_text
+        try:
+            await conn.execute(sa_text("SELECT completeness FROM legal_advice_log LIMIT 1"))
+        except Exception:
+            await conn.execute(sa_text("DROP TABLE IF EXISTS legal_advice_log"))
+            logger.info("Migrated legal_advice_log (dropped old schema)")
         await conn.run_sync(Base.metadata.create_all)
     logger.info("Database tables created")
     yield

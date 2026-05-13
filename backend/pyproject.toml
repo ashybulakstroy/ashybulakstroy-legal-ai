@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=64.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "legal-ai-agent"
 version = "0.1.0"
@@ -24,6 +28,10 @@ dev = [
     "ruff>=0.6.0",
     "mypy>=1.11.0",
 ]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
 
 [tool.ruff]
 line-length = 100

@@ -1,6 +1,6 @@
 param($Action = "start")
 $port = 8000
-$python = "C:\Work\Prj_2_Legal_AI\.venv\Scripts\python.exe"
+$python = "C:\Work\Prj_24_LAW_KZ\.venv\Scripts\python.exe"
 $workdir = $PSScriptRoot
 
 function Get-ProcessOnPort($port) {

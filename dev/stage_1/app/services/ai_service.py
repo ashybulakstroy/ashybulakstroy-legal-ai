@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import re
+import typing
 
 import httpx
 from sqlalchemy import select
@@ -338,6 +339,206 @@ async def generate_control_question(
                 await asyncio.sleep(1)
 
     return ""
+
+
+EXTRACT_CONDITIONS_PROMPT = """Ты — юридический аналитик РК. Извлеки условия применения данной статьи закона.
+
+Условие применения — это конкретное обстоятельство, которое должно быть (или отсутствовать), чтобы норма права применялась.
+Примеры: «работник отсутствовал более 3 часов», «акт об отсутствии составлен», «нет уважительной причины», «договор заключён в письменной форме».
+
+Статья: {article_title}
+Текст статьи: {article_content}
+
+Верни ТОЛЬКО JSON:
+{{
+  "conditions": [
+    {{
+      "condition_text": "текст условия",
+      "condition_type": "duration|document|circumstance|status|action|other",
+      "is_required": true
+    }}
+  ]
+}}
+
+Если в статье нет явных условий применения, верни {{"conditions": []}}"""
+
+
+COMPLETENESS_CHECK_PROMPT = """Ты — юрист РК. Проверь, достаточно ли деталей в описании ситуации для применения найденных статей закона.
+
+Ситуация клиента: {situation}
+
+Найденные статьи с условиями их применения:
+{articles_with_conditions}
+
+Тип клиента: {client_type}
+  forms — пользователь в веб/мобильном интерфейсе
+  api — программный вызов (агент)
+
+Задача:
+1. Для каждой статьи определи, какие её условия явно описаны или подразумеваются в ситуации, а какие не упомянуты.
+2. Оцени полноту описания (completeness 0-100):
+   - 100 = все условия всех статей описаны в ситуации или очевидно подразумеваются
+   - 0 = ни одного условия не описано
+3. Оцени свою уверенность (confidence 0-100)
+4. Составь suggestion:
+   - Если completeness < 100: исходная ситуация + уточняющие вопросы в конце
+   - Если completeness = 100: поставь suggestion = "-" (минус, признак пустого suggestion)
+5. Составь instruction:
+   - Если completeness < 100: команда для {client_type}-клиента, как отправить ответ
+   - Если completeness = 100: instruction = "-"
+
+Правила:
+- Если completeness < 100, НЕ давай юридический анализ, только вопросы
+- Если все условия уже описаны — completeness = 100
+- Не выдумывай условия, которых нет в статьях
+
+Верни ТОЛЬКО JSON без пояснений:
+{{
+  "completeness": 0-100,
+  "confidence": 0-100,
+  "clarifying_questions": ["вопрос1", "вопрос2"],
+  "suggestion": "исходная ситуация. вопрос1? вопрос2?",
+  "instruction": "Отправьте полное описание ситуации одним сообщением, дополнив его ответами на уточняющие вопросы."
+}}"""
+
+
+def _is_consistent_completeness(completeness: int, suggestion: str) -> bool:
+    if completeness < 100 and suggestion == "-":
+        return False
+    if completeness >= 100 and suggestion != "-":
+        return False
+    return True
+
+
+CallableProgress = typing.Callable[[str], typing.Awaitable[None]]
+
+
+async def check_completeness(
+    situation: str, articles_text: str, client_type: str = "forms",
+    progress_callback: CallableProgress | None = None,
+) -> dict:
+    headers = {"Content-Type": "application/json"}
+    if settings.openai_api_key and settings.openai_api_key != "not-needed":
+        headers["Authorization"] = f"Bearer {settings.openai_api_key}"
+
+    prompt = COMPLETENESS_CHECK_PROMPT.format(
+        situation=situation,
+        articles_with_conditions=articles_text,
+        client_type=client_type,
+    )
+
+    async def _warn(msg: str) -> None:
+        if progress_callback:
+            await progress_callback(msg)
+
+    models_to_try = [settings.openai_model] + _FALLBACK_MODELS
+    for model in models_to_try:
+        for attempt in range(2):
+            try:
+                if attempt > 0 or model != models_to_try[0]:
+                    await _warn(f"⚠ Модель {model} (попытка {attempt + 1})...")
+
+                async with httpx.AsyncClient(timeout=settings.openai_timeout, verify=False) as client:
+                    payload = {
+                        "model": model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.1,
+                        "max_tokens": 1024,
+                    }
+                    if model != settings.openai_model:
+                        payload["provider"] = "auto"
+
+                    resp = await client.post(
+                        f"{settings.openai_base_url}/chat/completions",
+                        json=payload,
+                        headers=headers,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    content = data["choices"][0]["message"]["content"]
+
+                    json_match = re.search(r"\{.*\}", content, re.DOTALL)
+                    if json_match:
+                        obj = json.loads(json_match.group())
+                        completeness = int(obj.get("completeness", 0))
+                        confidence = int(obj.get("confidence", 0))
+                        questions = obj.get("clarifying_questions", [])
+                        suggestion = obj.get("suggestion", situation)
+                        instruction = obj.get("instruction", "Отправьте полное описание ситуации одним сообщением, дополнив его ответами на уточняющие вопросы.")
+
+                        result = {
+                            "completeness": min(max(completeness, 0), 100),
+                            "confidence": min(max(confidence, 0), 100),
+                            "clarifying_questions": questions if isinstance(questions, list) else [],
+                            "suggestion": str(suggestion),
+                            "instruction": str(instruction),
+                        }
+
+                        if _is_consistent_completeness(result["completeness"], result["suggestion"]):
+                            return result
+                        await _warn(
+                            f"⚠ Неконсистентный ответ LLM: completeness={result['completeness']}, "
+                            f"suggestion={result['suggestion']!r} — повтор..."
+                        )
+            except Exception as e:
+                logger.warning("check_completeness %s attempt %d: %s", model, attempt + 1, e)
+                await _warn(f"⚠ Ошибка {model} (попытка {attempt + 1}): {e}")
+                await asyncio.sleep(0.5)
+
+    await _warn("✗ Все попытки исчерпаны, использую резервный ответ")
+    return {
+        "completeness": 100,
+        "confidence": 50,
+        "clarifying_questions": [],
+        "suggestion": "-",
+        "instruction": "-",
+    }
+
+
+async def extract_conditions_from_article(article_title: str, article_content: str) -> list[dict]:
+    headers = {"Content-Type": "application/json"}
+    if settings.openai_api_key and settings.openai_api_key != "not-needed":
+        headers["Authorization"] = f"Bearer {settings.openai_api_key}"
+
+    prompt = EXTRACT_CONDITIONS_PROMPT.format(
+        article_title=article_title or "",
+        article_content=article_content[:2000] if article_content else "",
+    )
+
+    models_to_try = [settings.openai_model] + _FALLBACK_MODELS
+    for model in models_to_try:
+        for attempt in range(2):
+            try:
+                async with httpx.AsyncClient(timeout=settings.openai_timeout, verify=False) as client:
+                    payload = {
+                        "model": model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.1,
+                        "max_tokens": 1024,
+                    }
+                    if model != settings.openai_model:
+                        payload["provider"] = "auto"
+
+                    resp = await client.post(
+                        f"{settings.openai_base_url}/chat/completions",
+                        json=payload,
+                        headers=headers,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    content = data["choices"][0]["message"]["content"]
+
+                    json_match = re.search(r"\{.*\}", content, re.DOTALL)
+                    if json_match:
+                        obj = json.loads(json_match.group())
+                        conditions = obj.get("conditions", [])
+                        if isinstance(conditions, list):
+                            return conditions
+            except Exception as e:
+                logger.warning("extract_conditions %s attempt %d: %s", model, attempt + 1, e)
+                await asyncio.sleep(0.5)
+
+    return []
 
 
 COVE_EXTRACT_PROMPT = """Ты — юрист-аналитик. Из данного юридического заключения выдели все фактические утверждения, которые можно проверить по исходным статьям законов.

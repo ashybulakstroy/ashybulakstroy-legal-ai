@@ -84,8 +84,9 @@ class ArticleExcerpt(BaseModel):
 class LegalAdviceRequest(BaseModel):
     situation: str
     context: str | None = None
-    search_method: str = "llm"
+    search_method: str = "auto"
     refresh: bool = False
+    client_type: str = "forms"
 
 
 class SelectionResult(BaseModel):
@@ -96,12 +97,17 @@ class SelectionResult(BaseModel):
 
 
 class LegalAdviceResponse(BaseModel):
-    situation: str
-    relevant_laws: list[SearchResult]
+    status: str = "PASS"
+    completeness: int = 0
+    confidence: int = 0
+    instruction: str | None = None
+    suggestion: str | None = None
+    clarifying_questions: list[str] = []
+    analysis: str | None = None
+    relevant_laws: list[SearchResult] = []
     relevant_articles: list[ArticleExcerpt] = []
-    analysis: str
     expanded_query: str | None = None
     refinement_hint: str | None = None
-    confidence: int = 0
     control_question: str | None = None
     disclaimer: str = "Данная информация носит справочный характер. Для получения официальной консультации обратитесь к квалифицированному юристу."
+    client_type: str = "forms"
