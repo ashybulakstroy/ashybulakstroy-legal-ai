@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ law.title }} — Законодательство РК</title>
+    <style>
+        :root {
+            --primary: #1a56db;
+            --primary-dark: #1340a0;
+            --bg: #f3f4f6;
+            --card: #ffffff;
+            --text: #111827;
+            --text-light: #6b7280;
+            --border: #e5e7eb;
+            --highlight: #fef08a;
+            --toc-width: 300px;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html { scroll-behavior: smooth; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.8;
+            font-size: 16px;
+        }
+
+        header {
+            background: linear-gradient(135deg, var(--primary), var(--primary-dark));
+            color: white;
+            padding: 24px 0;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+        header .container {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 20px;
+        }
+        header a {
+            color: white;
+            opacity: 0.8;
+            text-decoration: none;
+            font-size: 0.9em;
+            white-space: nowrap;
+        }
+        header a:hover { opacity: 1; }
+        header h1 {
+            font-size: 1em;
+            opacity: 0.9;
+            font-weight: 400;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .layout {
+            display: flex;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 20px;
+            gap: 24px;
+        }
+
+        .toc {
+            width: var(--toc-width);
+            flex-shrink: 0;
+            position: sticky;
+            top: 80px;
+            align-self: flex-start;
+            max-height: calc(100vh - 100px);
+            overflow-y: auto;
+            background: var(--card);
+            border-radius: 12px;
+            padding: 20px;
+            margin: 24px 0;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+            display: none;
+        }
+        .toc.visible { display: block; }
+        .toc-filter {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 8px 12px;
+            margin-bottom: 8px;
+            background: #fef9c3;
+            border-radius: 6px;
+            font-size: 0.85em;
+            cursor: pointer;
+        }
+        .toc-filter input { cursor: pointer; }
+        .toc h3 {
+            font-size: 0.9em;
+            color: var(--text-light);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 12px;
+        }
+        .toc a {
+            display: block;
+            padding: 4px 0;
+            color: var(--primary);
+            text-decoration: none;
+            font-size: 0.85em;
+            border-bottom: 1px solid var(--border);
+            transition: color 0.2s;
+        }
+        .toc a:hover { color: var(--primary-dark); }
+        .toc a.active { font-weight: 700; }
+        .toc .toc-section {
+            font-size: 0.8em;
+            font-weight: 700;
+            color: var(--text);
+            padding: 8px 0 2px;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+            border-bottom: 1px solid var(--primary);
+            margin-top: 4px;
+        }
+        .toc .toc-section:first-of-type { margin-top: 0; }
+
+        .content {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .law-header {
+            background: var(--card);
+            border-radius: 12px;
+            padding: 32px;
+            margin: 24px 0;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+        }
+        .law-header h1 { font-size: 1.6em; color: var(--text); margin-bottom: 12px; }
+        .law-meta {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 16px;
+            font-size: 0.9em;
+            color: var(--text-light);
+            margin-bottom: 16px;
+        }
+        .law-meta span {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .law-meta .badge {
+            display: inline-block;
+            padding: 2px 10px;
+            border-radius: 4px;
+            font-size: 0.85em;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        .badge-active { background: #dcfce7; color: #166534; }
+        .badge-amended { background: #fef9c3; color: #854d0e; }
+        .badge-repealed { background: #fef2f2; color: #991b1b; }
+        .badge-draft { background: #f3f4f6; color: #4b5563; }
+
+        .summary {
+            background: #f0f5ff;
+            border-left: 4px solid var(--primary);
+            padding: 16px 20px;
+            border-radius: 0 8px 8px 0;
+            font-size: 0.95em;
+            color: #374151;
+            margin-bottom: 24px;
+        }
+
+        .law-filter {
+            margin: 16px 0;
+        }
+        .law-filter input {
+            width: 100%;
+            padding: 12px 16px;
+            font-size: 1em;
+            border: 2px solid var(--border);
+            border-radius: 8px;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        .law-filter input:focus { border-color: var(--primary); }
+        .law-filter .match-info {
+            font-size: 0.85em;
+            color: var(--text-light);
+            margin-top: 6px;
+        }
+
+        .articles { margin: 24px 0; }
+        .article {
+            background: var(--card);
+            border-radius: 8px;
+            padding: 24px;
+            margin-bottom: 12px;
+            box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+            scroll-margin-top: 80px;
+        }
+        .article.hidden { display: none; }
+        .article.highlighted {
+            box-shadow: 0 0 0 3px var(--primary), 0 2px 8px rgba(0,0,0,0.1);
+        }
+        .article-number {
+            font-size: 1.1em;
+            font-weight: 700;
+            color: var(--primary);
+            margin-bottom: 8px;
+        }
+        .article-number a {
+            color: inherit;
+            text-decoration: none;
+        }
+        .article-number a:hover { text-decoration: underline; }
+        .article-title {
+            font-size: 1em;
+            font-weight: 600;
+            color: var(--text);
+            margin-bottom: 12px;
+        }
+        .article-content {
+            font-size: 0.95em;
+            color: #374151;
+            white-space: pre-wrap;
+        }
+        .article-content mark {
+            background: var(--highlight);
+            padding: 0 2px;
+            border-radius: 2px;
+        }
+        .article-content p { margin-bottom: 8px; }
+
+        .section-header {
+            background: linear-gradient(135deg, var(--primary), var(--primary-dark));
+            color: white;
+            border-radius: 8px;
+            padding: 12px 20px;
+            margin: 20px 0 12px;
+            font-size: 1em;
+            font-weight: 600;
+            scroll-margin-top: 80px;
+        }
+
+        .no-match {
+            text-align: center;
+            padding: 40px;
+            color: var(--text-light);
+            display: none;
+        }
+
+        .tabs {
+            display: flex;
+            gap: 4px;
+            margin: 20px 0;
+            border-bottom: 2px solid var(--border);
+            padding-bottom: 0;
+        }
+        .tab-btn {
+            padding: 10px 24px;
+            background: transparent;
+            border: none;
+            border-bottom: 2px solid transparent;
+            margin-bottom: -2px;
+            font-size: 0.95em;
+            font-weight: 600;
+            color: var(--text-light);
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .tab-btn:hover { color: var(--primary); }
+        .tab-btn.active {
+            color: var(--primary);
+            border-bottom-color: var(--primary);
+        }
+        .tab-content { display: block; }
+        .tab-content.hidden { display: none; }
+
+        .toc-toggle {
+            display: none;
+            background: var(--card);
+            border: 2px solid var(--border);
+            border-radius: 8px;
+            padding: 8px 16px;
+            cursor: pointer;
+            font-size: 0.9em;
+            color: var(--primary);
+            margin: 12px 0;
+        }
+        .toc-toggle:hover { border-color: var(--primary); }
+
+        footer {
+            text-align: center;
+            padding: 32px 0;
+            color: var(--text-light);
+            font-size: 0.85em;
+        }
+
+        @media (max-width: 900px) {
+            .layout { flex-direction: column; }
+            .toc {
+                width: 100%;
+                position: static;
+                max-height: none;
+                display: none;
+            }
+            .toc.visible { display: block; }
+            .toc-toggle { display: inline-block; }
+            .law-header h1 { font-size: 1.3em; }
+            .article { padding: 16px; }
+        }
+    </style>
+</head>
+<body>
+
+<header>
+    <div class="container">
+        <a href="javascript:history.back()">← Назад</a>
+        <h1>{{ law.category.name if law.category else '' }}</h1>
+    </div>
+</header>
+
+<div class="layout">
+    <nav class="toc{% if law.articles %} visible{% endif %}" id="toc">
+        {% if query %}
+        <label class="toc-filter">
+            <input type="checkbox" id="filter-toggle" checked onchange="toggleFilter()" />
+            Поиск «{{ query }}»
+        </label>
+        {% endif %}
+        <h3>Содержание</h3>
+        <div id="toc-blocks">
+        {% if blocks %}
+        {% set toc_ns = namespace(last='') %}
+        {% for block in blocks %}
+        {% if block.section_name and block.section_name != toc_ns.last %}
+        <div class="toc-section">{{ block.section_name }}</div>
+        {% set toc_ns.last = block.section_name %}
+        {% endif %}
+        <a href="#article-{{ block.article_id }}" data-id="{{ block.article_id }}">Статья {{ block.article_number }}</a>
+        {% endfor %}
+        {% endif %}
+        </div>
+        <div id="toc-full" style="display:none">
+        {% for section in sections %}
+        {% if section.name %}
+        <div class="toc-section">{{ section.name }}</div>
+        {% endif %}
+        {% for article in section.articles %}
+        <a href="#article-{{ article.id }}" data-id="{{ article.id }}">Статья {{ article.number }}</a>
+        {% endfor %}
+        {% endfor %}
+        </div>
+    </nav>
+
+    <div class="content">
+        <div class="tabs">
+            <button class="tab-btn active" onclick="switchTab('about')">📄 О законе</button>
+            <button class="tab-btn" onclick="switchTab('articles')">📑 Статьи</button>
+        </div>
+
+        <div class="tab-content" id="tab-about">
+            <div class="law-header">
+                <h1>{{ law.title }}</h1>
+                <div class="law-meta">
+                    {% if law.number %}
+                    <span>№ {{ law.number }}</span>
+                    {% endif %}
+                    {% if law.date_adopted %}
+                    <span>Принят: {{ law.date_adopted }}</span>
+                    {% endif %}
+                    {% if law.category %}
+                    <span>Категория: {{ law.category.name }}</span>
+                    {% endif %}
+                    <span class="badge badge-{{ law.status.value if law.status else 'active' }}">
+                        {% if law.status.value == 'active' %}Действует
+                        {% elif law.status.value == 'amended' %}С изменениями
+                        {% elif law.status.value == 'repealed' %}Утратил силу
+                        {% else %}{{ law.status.value }}
+                        {% endif %}
+                    </span>
+                </div>
+                {% if law.summary %}
+                <div class="summary">{{ law.summary }}</div>
+                {% endif %}
+            </div>
+            {% if law.full_text %}
+            <div class="law-header" style="margin-top:16px">
+                <h2 style="font-size:1.2em;margin-bottom:12px">Полный текст</h2>
+                <div class="article-content">{{ law.full_text }}</div>
+            </div>
+            {% endif %}
+        </div>
+
+        <div class="tab-content hidden" id="tab-articles">
+            {% if law.articles %}
+            <button class="toc-toggle" onclick="toggleToc()" id="toc-toggle-btn">📑 Содержание</button>
+            {% endif %}
+
+            {% if query and blocks %}
+            <div class="match-info" style="margin: 16px 0;">
+                Найдено по запросу «{{ query }}» — {{ blocks|length }} статей
+            </div>
+            {% endif %}
+            <div class="law-filter" id="law-filter"{% if query and blocks %} style="display:none"{% endif %}>
+                <input type="text" id="article-filter" placeholder="🔍 Найти в тексте закона..." />
+                <div class="match-info" id="match-info"></div>
+            </div>
+
+            <div class="articles" id="articles-blocks"{% if not query or not blocks %} style="display:none"{% endif %}>
+                {% for block in blocks %}
+                {% if block.section_name %}
+                <div class="section-header">{{ block.section_name }}</div>
+                {% endif %}
+                <div class="article" id="article-{{ block.article_id }}" data-number="{{ block.article_number }}">
+                    <div class="article-number"><a href="#article-{{ block.article_id }}">Статья {{ block.article_number }}</a></div>
+                    {% if block.article_title %}
+                    <div class="article-title">{{ block.article_title }}</div>
+                    {% endif %}
+                    {% for para in block.paragraphs %}
+                    <div class="article-content">{{ para|safe }}</div>
+                    {% endfor %}
+                </div>
+                {% endfor %}
+            </div>
+            <div class="articles" id="articles-full"{% if query and blocks %} style="display:none"{% endif %}>
+                {% for section in sections %}
+                {% if section.name %}
+                <div class="section-header" id="section-{{ section.name|replace(' ', '-')|lower }}">{{ section.name }}</div>
+                {% endif %}
+                {% for article in section.articles %}
+                <div class="article" id="article-{{ article.id }}" data-number="{{ article.number }}">
+                    <div class="article-number"><a href="#article-{{ article.id }}">Статья {{ article.number }}</a></div>
+                    {% if article.title %}
+                    <div class="article-title">{{ article.title }}</div>
+                    {% endif %}
+                    <div class="article-content">{{ article.content }}</div>
+                </div>
+                {% endfor %}
+                {% endfor %}
+            </div>
+
+            <div class="no-match" id="no-match">Нет совпадений</div>
+        </div>
+    </div>
+</div>
+
+<footer>
+    Законодательство Республики Казахстан — Справочная информация
+</footer>
+
+<script>
+let currentQuery = '{{ query }}';
+
+function switchTab(name) {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(c => c.classList.add('hidden'));
+    document.querySelector(`.tab-btn[onclick*='${name}']`).classList.add('active');
+    document.getElementById(`tab-${name}`).classList.remove('hidden');
+    if (name === 'articles' && !document.querySelector('#articles-full .article')) {
+        document.getElementById('toc-toggle-btn')?.click();
+    }
+}
+
+function toggleToc() {
+    document.getElementById('toc').classList.toggle('visible');
+}
+
+function setupObserver(containerId) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+    const links = container.querySelectorAll('.toc a');
+    const articles = document.getElementById(containerId === 'toc-blocks' ? 'articles-blocks' : 'articles-full');
+    if (!articles) return;
+    const articleEls = articles.querySelectorAll('.article');
+    if (!links.length || !articleEls.length) return;
+    const observer = new IntersectionObserver((entries) => {
+        entries.forEach(entry => {
+            if (entry.isIntersecting) {
+                const id = entry.target.id.replace('article-', '');
+                links.forEach(l => l.classList.toggle('active', l.dataset.id === id));
+            }
+        });
+    }, { rootMargin: '-80px 0px -60% 0px' });
+    articleEls.forEach(a => observer.observe(a));
+}
+
+function toggleFilter() {
+    const checked = document.getElementById('filter-toggle').checked;
+    document.getElementById('articles-blocks').style.display = checked ? '' : 'none';
+    document.getElementById('articles-full').style.display = checked ? 'none' : '';
+    document.getElementById('toc-blocks').style.display = checked ? '' : 'none';
+    document.getElementById('toc-full').style.display = checked ? 'none' : '';
+    document.getElementById('law-filter').style.display = checked ? 'none' : '';
+    const matchInfo = document.querySelector('.match-info');
+    if (matchInfo) matchInfo.style.display = checked ? '' : 'none';
+}
+
+const filterInput = document.getElementById('article-filter');
+const matchInfo = document.getElementById('match-info');
+const noMatch = document.getElementById('no-match');
+
+function highlightText(element, text) {
+    if (!text) return;
+    text = text.toLowerCase();
+    const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT, null, false);
+    const nodes = [];
+    while (walker.nextNode()) nodes.push(walker);
+    for (const node of nodes) {
+        const idx = node.textContent.toLowerCase().indexOf(text);
+        if (idx === -1) continue;
+        const span = document.createElement('span');
+        const before = node.textContent.slice(0, idx);
+        const match = node.textContent.slice(idx, idx + text.length);
+        const after = node.textContent.slice(idx + text.length);
+        span.appendChild(document.createTextNode(before));
+        const mark = document.createElement('mark');
+        mark.textContent = match;
+        span.appendChild(mark);
+        span.appendChild(document.createTextNode(after));
+        node.parentNode.replaceChild(span, node);
+    }
+}
+
+function filterArticles() {
+    const q = filterInput.value.toLowerCase().trim();
+    const articles = document.querySelectorAll('#articles-full .article');
+    const sectionHeaders = document.querySelectorAll('#articles-full .section-header');
+    let visibleCount = 0;
+    let firstVisible = null;
+
+    articles.forEach(article => {
+        const text = article.textContent.toLowerCase();
+        if (!q || text.includes(q)) {
+            article.classList.remove('hidden');
+            visibleCount++;
+            if (!firstVisible) firstVisible = article;
+        } else {
+            article.classList.add('hidden');
+        }
+    });
+
+    sectionHeaders.forEach(header => {
+        let next = header.nextElementSibling;
+        let hasVisible = false;
+        while (next && !next.classList.contains('section-header')) {
+            if (next.classList.contains('article') && !next.classList.contains('hidden')) {
+                hasVisible = true;
+                break;
+            }
+            next = next.nextElementSibling;
+        }
+        header.style.display = hasVisible ? 'block' : 'none';
+    });
+
+    if (q) {
+        matchInfo.textContent = `Найдено: ${visibleCount} из ${articles.length} статей`;
+        noMatch.style.display = visibleCount === 0 ? 'block' : 'none';
+        if (firstVisible) firstVisible.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } else {
+        matchInfo.textContent = '';
+        noMatch.style.display = 'none';
+        sectionHeaders.forEach(h => h.style.display = '');
+    }
+}
+
+if (filterInput) {
+    filterInput.addEventListener('input', filterArticles);
+}
+
+// Initial setup
+if (currentQuery) {
+    switchTab('articles');
+    setupObserver('toc-blocks');
+    if (filterInput) filterInput.value = currentQuery;
+    if (!document.getElementById('filter-toggle') || !document.getElementById('filter-toggle').checked) {
+        filterArticles();
+    }
+    document.querySelectorAll('#articles-full .article-content').forEach(el => highlightText(el, currentQuery));
+    document.querySelectorAll('#articles-full .article-title').forEach(el => highlightText(el, currentQuery));
+} else {
+    setupObserver('toc-full');
+}
+</script>
+
+</body>
+</html>

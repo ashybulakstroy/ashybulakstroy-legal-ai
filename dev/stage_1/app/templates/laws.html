@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ title }} — Законодательство РК</title>
+    <style>
+        :root {
+            --primary: #1a56db;
+            --primary-dark: #1340a0;
+            --bg: #f3f4f6;
+            --card: #ffffff;
+            --text: #111827;
+            --text-light: #6b7280;
+            --border: #e5e7eb;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+        }
+        .container { max-width: 1100px; margin: 0 auto; padding: 0 20px; }
+
+        header {
+            background: linear-gradient(135deg, var(--primary), var(--primary-dark));
+            color: white;
+            padding: 30px 0;
+        }
+        header h1 { font-size: 1.5em; }
+        header a { color: rgba(255,255,255,0.8); text-decoration: none; font-size: 0.9em; }
+        header a:hover { color: white; text-decoration: underline; }
+
+        .content { padding: 24px 0; }
+
+        .filters {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+        .filters a {
+            padding: 6px 16px;
+            border-radius: 20px;
+            background: var(--card);
+            border: 1px solid var(--border);
+            text-decoration: none;
+            color: var(--text);
+            font-size: 0.9em;
+            transition: all 0.2s;
+        }
+        .filters a:hover, .filters a.active {
+            background: var(--primary);
+            color: white;
+            border-color: var(--primary);
+        }
+
+        .law-item {
+            background: var(--card);
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 8px;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.06);
+            transition: box-shadow 0.2s;
+        }
+        .law-item:hover { box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+        .law-item h3 { font-size: 1em; color: var(--primary); margin-bottom: 4px; }
+        .law-item .meta { font-size: 0.85em; color: var(--text-light); }
+        .law-item .cat-badge {
+            display: inline-block;
+            font-size: 0.75em;
+            padding: 2px 8px;
+            border-radius: 4px;
+            background: #dbeafe;
+            color: var(--primary);
+        }
+        .law-item .summary { font-size: 0.9em; margin-top: 4px; color: var(--text); }
+        .law-item a { text-decoration: none; color: inherit; display: block; }
+
+        .total { font-size: 0.9em; color: var(--text-light); margin-bottom: 16px; }
+
+        @media (max-width: 600px) {
+            header h1 { font-size: 1.2em; }
+        }
+    </style>
+</head>
+<body>
+
+<header>
+    <div class="container">
+        <a href="/">&larr; На главную</a>
+        <h1>{{ title }}</h1>
+    </div>
+</header>
+
+<main class="container">
+    <div class="content">
+        <div class="filters">
+            <a href="/laws" class="{% if not filter_type %}active{% endif %}">Все</a>
+            <a href="/laws?type=codex" class="{% if filter_type == 'codex' %}active{% endif %}">Кодексы</a>
+            <a href="/laws?type=law" class="{% if filter_type == 'law' %}active{% endif %}">Законы</a>
+            <a href="/laws?type=constitution" class="{% if filter_type == 'constitution' %}active{% endif %}">Конституция</a>
+        </div>
+
+        <div class="total">Найдено: {{ laws|length }} документов</div>
+
+        {% for law in laws %}
+        <div class="law-item">
+            <a href="/law/{{ law.id }}">
+                <h3>{{ law.title }}{% if law.number %} (№{{ law.number }}){% endif %}</h3>
+                <div class="meta">
+                    <span class="cat-badge">{{ law.category_name or law.category.name }}</span>
+                    <span>{{ law.status.value }}</span>
+                    <span>· {{ law.articles|length }} статей</span>
+                </div>
+                {% if law.summary %}
+                <div class="summary">{{ law.summary[:200] }}{% if law.summary|length > 200 %}...{% endif %}</div>
+                {% endif %}
+            </a>
+        </div>
+        {% endfor %}
+    </div>
+</main>
+
+</body>
+</html>

@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ category.name }} — Законодательство РК</title>
+    <style>
+        :root {
+            --primary: #1a56db;
+            --primary-dark: #1340a0;
+            --bg: #f3f4f6;
+            --card: #ffffff;
+            --text: #111827;
+            --text-light: #6b7280;
+            --border: #e5e7eb;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+        }
+        .container { max-width: 900px; margin: 0 auto; padding: 0 20px; }
+
+        header {
+            background: linear-gradient(135deg, var(--primary), var(--primary-dark));
+            color: white;
+            padding: 24px 0;
+        }
+        header .container {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+        header a {
+            color: white;
+            opacity: 0.8;
+            text-decoration: none;
+            font-size: 0.9em;
+        }
+        header a:hover { opacity: 1; }
+        header h1 { font-size: 1em; opacity: 0.9; font-weight: 400; }
+
+        .cat-header {
+            background: var(--card);
+            border-radius: 12px;
+            padding: 32px;
+            margin: 24px 0;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+        }
+        .cat-header h1 { font-size: 1.6em; color: var(--text); margin-bottom: 8px; }
+        .cat-header .type {
+            display: inline-block;
+            font-size: 0.75em;
+            padding: 3px 10px;
+            border-radius: 4px;
+            background: #dbeafe;
+            color: var(--primary);
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        .cat-header p { color: var(--text-light); margin-top: 12px; font-size: 0.95em; }
+
+        .laws { margin: 24px 0; }
+        .law-card {
+            background: var(--card);
+            border-radius: 8px;
+            padding: 20px 24px;
+            margin-bottom: 10px;
+            box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+            text-decoration: none;
+            color: var(--text);
+            display: block;
+            transition: box-shadow 0.2s, transform 0.2s;
+        }
+        .law-card:hover {
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            transform: translateY(-1px);
+        }
+        .law-card h2 {
+            font-size: 1.1em;
+            color: var(--primary);
+            margin-bottom: 6px;
+        }
+        .law-card .meta {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            font-size: 0.85em;
+            color: var(--text-light);
+        }
+        .law-card .articles-count {
+            font-size: 0.85em;
+            color: var(--text-light);
+            margin-top: 4px;
+        }
+        .law-card .badge {
+            display: inline-block;
+            padding: 1px 8px;
+            border-radius: 4px;
+            font-size: 0.8em;
+            font-weight: 600;
+        }
+        .badge-active { background: #dcfce7; color: #166534; }
+        .badge-amended { background: #fef9c3; color: #854d0e; }
+        .badge-repealed { background: #fef2f2; color: #991b1b; }
+
+        .empty {
+            text-align: center;
+            padding: 40px;
+            color: var(--text-light);
+            background: var(--card);
+            border-radius: 8px;
+        }
+
+        footer {
+            text-align: center;
+            padding: 32px 0;
+            color: var(--text-light);
+            font-size: 0.85em;
+        }
+
+        @media (max-width: 600px) {
+            .cat-header { padding: 20px; }
+            .cat-header h1 { font-size: 1.3em; }
+            .law-card { padding: 16px; }
+        }
+    </style>
+</head>
+<body>
+
+<header>
+    <div class="container">
+        <a href="/">← На главную</a>
+        <h1>Категория: {{ category.name }}</h1>
+    </div>
+</header>
+
+<main class="container">
+    <div class="cat-header">
+        <span class="type">{{ category.type }}</span>
+        <h1>{{ category.name }}</h1>
+        {% if category.description %}
+        <p>{{ category.description }}</p>
+        {% endif %}
+    </div>
+
+    <div class="laws">
+        {% for law in category.laws %}
+        <a href="/law/{{ law.id }}" class="law-card">
+            <h2>{{ law.title }}</h2>
+            <div class="meta">
+                {% if law.number %}
+                <span>№ {{ law.number }}</span>
+                {% endif %}
+                {% if law.date_adopted %}
+                <span>Принят: {{ law.date_adopted }}</span>
+                {% endif %}
+                <span class="badge badge-{{ law.status.value if law.status else 'active' }}">
+                    {% if law.status.value == 'active' %}Действует
+                    {% elif law.status.value == 'amended' %}С изменениями
+                    {% elif law.status.value == 'repealed' %}Утратил силу
+                    {% else %}{{ law.status.value }}
+                    {% endif %}
+                </span>
+            </div>
+            <div class="articles-count">{{ law.articles|length }} статей</div>
+        </a>
+        {% else %}
+        <div class="empty">В этой категории пока нет законов</div>
+        {% endfor %}
+    </div>
+</main>
+
+<footer>
+    Законодательство Республики Казахстан — Справочная информация
+</footer>
+
+</body>
+</html>

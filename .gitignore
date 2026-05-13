@@ -41,3 +41,8 @@ Desktop.ini
 # Database
 *.db
 *.sqlite
+
+# Temp / trash
+last_resp*.json
+resp.json
+fix_summary.py
