@@ -6,14 +6,14 @@ from fastapi import FastAPI, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 from jinja2 import Environment, FileSystemLoader
-from sqlalchemy import select, func
+from sqlalchemy import select, func, case
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import engine, Base, get_db
 from app.api.routes import router as api_router
 from app.admin.admin import setup_admin
-from app.models.legislation import Category, CategoryType, Law, Article, SearchCache, QueryExpansionCache
+from app.models.legislation import Category, CategoryType, Law, Article, SearchCache, QueryExpansionCache, LegalAdviceLog
 
 logging.basicConfig(
     level=logging.INFO,
@@ -91,6 +91,80 @@ async def get_stats(db: AsyncSession = Depends(get_db)):
         "articles": articles_count or 0,
         "codes": codes_count or 0,
     }
+
+
+@app.get("/stats/detail", response_class=HTMLResponse)
+async def stats_detail_page(request: Request, db: AsyncSession = Depends(get_db)):
+    from collections import Counter
+    import json
+    from sqlalchemy import select as sa_select
+
+    total = await db.scalar(sa_select(func.count(LegalAdviceLog.id))) or 0
+    consults = await db.scalar(sa_select(func.count(LegalAdviceLog.id)).where(LegalAdviceLog.endpoint == "consult")) or 0
+    searches = await db.scalar(sa_select(func.count(LegalAdviceLog.id)).where(LegalAdviceLog.endpoint == "search")) or 0
+    fails = await db.scalar(sa_select(func.count(LegalAdviceLog.id)).where(LegalAdviceLog.status == "FAIL")) or 0
+
+    rows = await db.execute(
+        sa_select(LegalAdviceLog.matched_categories).where(
+            LegalAdviceLog.matched_categories.isnot(None),
+            LegalAdviceLog.endpoint == "consult",
+            LegalAdviceLog.confidence >= 50,
+        ).limit(200)
+    )
+    cat_counter: Counter = Counter()
+    for (row,) in rows:
+        try:
+            cats = json.loads(row)
+            if cats:
+                cat_counter[cats[0]] += 1
+        except Exception:
+            pass
+    top_categories = [{"name": k, "count": v} for k, v in cat_counter.most_common(10)]
+
+    daily_rows = await db.execute(
+        sa_select(
+            func.date(LegalAdviceLog.created_at).label("day"),
+            func.count(LegalAdviceLog.id).label("total"),
+            func.sum(case((LegalAdviceLog.endpoint == "consult", 1), else_=0)).label("consults"),
+            func.sum(case((LegalAdviceLog.endpoint == "search", 1), else_=0)).label("searches"),
+        ).group_by(func.date(LegalAdviceLog.created_at)).order_by(func.date(LegalAdviceLog.created_at).desc()).limit(30)
+    )
+    daily = []
+    for row in daily_rows:
+        daily.append({
+            "day": str(row.day),
+            "total": row.total,
+            "consults": row.consults or 0,
+            "searches": row.searches or 0,
+        })
+
+    recent_rows = await db.execute(
+        sa_select(LegalAdviceLog).order_by(LegalAdviceLog.created_at.desc()).limit(20)
+    )
+    recent = []
+    for r in recent_rows.scalars():
+        recent.append({
+            "id": r.id,
+            "situation": r.situation[:120] + ("..." if len(r.situation) > 120 else ""),
+            "endpoint": r.endpoint,
+            "status": r.status,
+            "confidence": r.confidence,
+            "created_at": r.created_at.strftime("%Y-%m-%d %H:%M") if r.created_at else "",
+        })
+
+    template = _jinja_env.get_template("stats.html")
+    html = template.render(
+        stats={
+            "total": total,
+            "consultations": consults,
+            "searches": searches,
+            "fails": fails,
+        },
+        top_categories=top_categories,
+        daily=daily,
+        recent=recent,
+    )
+    return HTMLResponse(html)
 
 
 @app.get("/category/{slug}", response_class=HTMLResponse)

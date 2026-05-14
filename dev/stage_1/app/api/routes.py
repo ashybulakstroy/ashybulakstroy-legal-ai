@@ -793,14 +793,16 @@ async def legal_advice_stats(service: LegislationService = Depends(get_service))
         sa_select(LegalAdviceLog.matched_categories).where(
             LegalAdviceLog.matched_categories.isnot(None),
             LegalAdviceLog.endpoint == "consult",
-        ).limit(100)
+            LegalAdviceLog.confidence >= 50,
+        ).limit(200)
     )
     from collections import Counter
     cat_counter: Counter = Counter()
     for (row,) in rows:
         try:
-            for c in json.loads(row):
-                cat_counter[c] += 1
+            cats = json.loads(row)
+            if cats:
+                cat_counter[cats[0]] += 1
         except Exception:
             pass
 
