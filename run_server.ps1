@@ -26,7 +26,9 @@ Start-Sleep -Seconds 1
 # Strip Prj_21_Odoo from PATH so uvicorn spawns correct Python child
 $cleanPath = ($env:PATH -split ';' | Where-Object { $_ -notlike '*Prj_21_Odoo*' }) -join ';'
 $env:PATH = "$(Split-Path $python);$cleanPath"
+$env:DEBUG = "false"
 
-$args = "-m uvicorn app.main:app --host 0.0.0.0 --port $port --log-level error"
+$env:PYTHONPATH = $workdir
+$args = "run_app.py"
 $proc = Start-Process -FilePath $python -ArgumentList $args -WorkingDirectory $workdir -WindowStyle Hidden -PassThru
 "Server started on port $port (PID: $($proc.Id))"

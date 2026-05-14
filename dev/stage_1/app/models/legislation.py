@@ -92,6 +92,7 @@ class QueryExpansionCache(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     original_query: Mapped[str] = mapped_column(String(500), nullable=False, unique=True)
     expanded_query: Mapped[str] = mapped_column(String(500), nullable=False)
+    confidence: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     def __repr__(self) -> str:

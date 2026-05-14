@@ -15,6 +15,31 @@ logger = logging.getLogger(__name__)
 _expansion_cache: dict[str, str] = {}
 _MAX_RETRIES = 10
 
+
+def _build_headers() -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    if settings.openai_api_key and settings.openai_api_key != "not-needed":
+        headers["Authorization"] = f"Bearer {settings.openai_api_key}"
+    return headers
+
+
+def _build_payload(
+    model: str = "auto",
+    messages: list | None = None,
+    temperature: float = 0.1,
+    max_tokens: int = 1024,
+    provider: str = "auto",
+) -> dict:
+    payload: dict = {
+        "provider": provider,
+        "model": model,
+        "metadata": {"client_id": settings.llm_client_id},
+        "messages": messages or [],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    return payload
+
 _discovered_models: list[str] | None = None
 _DISCOVERY_LOCK = asyncio.Lock()
 _CHAT_EXCLUDE_KEYWORDS = frozenset([
@@ -49,14 +74,10 @@ async def _discover_models() -> list[str]:
             return _discovered_models
 
         try:
-            headers = {}
-            if settings.openai_api_key and settings.openai_api_key != "not-needed":
-                headers["Authorization"] = f"Bearer {settings.openai_api_key}"
-
             async with httpx.AsyncClient(timeout=10, verify=False) as client:
                 resp = await client.get(
                     f"{settings.openai_base_url}/models",
-                    headers=headers,
+                    headers=_build_headers(),
                 )
                 resp.raise_for_status()
                 data = resp.json()
@@ -73,116 +94,141 @@ async def _discover_models() -> list[str]:
             return []
 
 
-def _parse_expansion(raw: str) -> str | None:
+NEW_EXPANSION_PROMPT = """Ты — юридический аналитик. Определи тип ситуации и сгенерируй поисковые запросы.
+
+Ситуация: {query}
+
+Верни ТОЛЬКО JSON:
+{{
+  "situation_type": "ДТП|трудовой_спор|наследство|жилищный_спор|договор|административное_право|уголовное_право|семейное_право|налоговое_право|земельное_право|исполнительное_производство|иное",
+  "search_queries": [
+    "конкретные термины описывающие ситуацию",
+    "синонимы и юридические эквиваленты"
+  ],
+  "confidence": 0-100
+}}
+
+Правила:
+- 3-5 поисковых запросов, каждый 2-4 слова
+- Используй термины, которые МОГУТ БЫТЬ В ТЕКСТЕ закона или статьи
+- Не выдумывай номера статей и конкретные отсылки к законам
+- Не используй общие слова вроде ответственность, обязанность, право, нарушение — они есть в каждом законе и не помогают искать
+- Вместо "административная ответственность" напиши "правила дорожного движения" или "аварийная обстановка"
+- Если ситуация про ДТП: пиши "дорожное движение транспортное средство авария"
+- Если про магазин: пиши "товар возврат недостаток продавец потребитель"
+- Если про работу: пиши "трудовой договор зарплата увольнение работник"
+- confidence = насколько ты уверен, что запросы помогут найти relevant статьи
+- Не добавляй пояснений, только JSON"""
+
+
+def _parse_expansion_response(raw: str) -> tuple[str | None, int]:
     text = raw.strip()
     if not text:
-        return None
+        return None, 0
 
     json_match = re.search(r"\{.*\}", text, re.DOTALL)
     if json_match:
         try:
             obj = json.loads(json_match.group())
-            q = obj.get("search_query", "")
-            if isinstance(q, str) and q.strip():
-                words = q.strip().split()
-                if 1 <= len(words) <= 10:
-                    return " ".join(words[:10])
-        except (json.JSONDecodeError, TypeError):
+            confidence = min(max(int(obj.get("confidence", 0)), 0), 100)
+            queries = obj.get("search_queries", [])
+            if isinstance(queries, list) and queries:
+                # Filter out queries with RF-specific article references
+                filtered = [q for q in queries if isinstance(q, str) and not re.search(r'\bстатья\s+\d+', q, re.IGNORECASE)]
+                if not filtered:
+                    filtered = queries
+                best = max(filtered, key=lambda q: len(q.split())) if len(filtered) > 1 else filtered[0]
+                if isinstance(best, str) and best.strip():
+                    words = best.strip().split()
+                    if 1 <= len(words) <= 10:
+                        return " ".join(words[:10]), confidence
+        except (json.JSONDecodeError, TypeError, ValueError):
             pass
 
     words = re.findall(r"[а-яёa-z]+", text.lower())
     words = [w for w in words if len(w) > 2]
     if 1 <= len(words) <= 10:
-        return " ".join(words[:10])
+        return " ".join(words[:10]), 30
 
-    return None
+    return None, 0
 
 
-async def _try_expansion_model(query: str, model: str, use_provider_auto: bool) -> str | None:
-    headers = {"Content-Type": "application/json"}
-    if settings.openai_api_key and settings.openai_api_key != "not-needed":
-        headers["Authorization"] = f"Bearer {settings.openai_api_key}"
-
-    prompt = (
-        "Преобразуй бытовой запрос в поисковые юридические термины.\n"
-        "Верни ТОЛЬКО JSON: {\"search_query\": \"термин1 термин2 термин3\"}\n"
-        "2-5 ключевых слов, без пояснений.\n\n"
-        f"Запрос: {query}"
-    )
+async def _try_expansion_model(query: str, model: str = "auto") -> tuple[str | None, int]:
+    prompt = NEW_EXPANSION_PROMPT.format(query=query)
 
     try:
         async with httpx.AsyncClient(timeout=settings.openai_timeout, verify=False) as client:
-            payload = {
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.1,
-                "max_tokens": 512,
-            }
-            if use_provider_auto:
-                payload["provider"] = "auto"
+            payload = _build_payload(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=512,
+            )
 
             resp = await client.post(
                 f"{settings.openai_base_url}/chat/completions",
                 json=payload,
-                headers=headers,
+                headers=_build_headers(),
             )
             resp.raise_for_status()
             data = resp.json()
             msg = data["choices"][0]["message"]
 
             content = (msg.get("content") or "").strip()
-            parsed = _parse_expansion(content)
+            parsed, conf = _parse_expansion_response(content)
             if parsed:
-                return parsed
+                return parsed, conf
 
             reasoning = (msg.get("reasoning") or "").strip()
-            parsed = _parse_expansion(reasoning)
+            parsed, conf = _parse_expansion_response(reasoning)
             if parsed:
-                return parsed
+                return parsed, conf
 
-            logger.warning("Expansion model %s (provider=auto=%s) no parseable output", model, use_provider_auto)
+            logger.warning("Expansion model %s no parseable output", model)
     except Exception as e:
-        logger.warning("Expansion model %s (provider=auto=%s) failed (%s)", model, use_provider_auto, e)
+        logger.warning("Expansion model %s failed (%s)", model, e)
 
-    return None
+    return None, 0
 
 
-async def _call_expansion(query: str) -> str | None:
-    models_to_try = [settings.openai_model] + _FALLBACK_MODELS
+async def _call_expansion(query: str) -> tuple[str | None, int]:
+    if settings.llm_model == "auto":
+        result, conf = await _try_expansion_model(query)
+        return (result, conf) if result else (None, 0)
 
+    best_result = None
+    best_conf = 0
+
+    result, conf = await _try_expansion_model(query)
+    if result:
+        if conf >= best_conf:
+            best_result, best_conf = result, conf
+
+    models_to_try = [settings.llm_model] + _FALLBACK_MODELS
     for model in models_to_try:
-        result = await _try_expansion_model(query, model, False)
-        if result is not None:
-            return result
+        result, conf = await _try_expansion_model(query, model)
+        if result and conf > best_conf:
+            best_result, best_conf = result, conf
 
-    discovered_triggered = False
-    for model in models_to_try:
-        result = await _try_expansion_model(query, model, True)
-        if result is not None:
-            return result
-        if not discovered_triggered:
-            discovered_triggered = True
+    discovered = await _discover_models()
+    already_tried = set(models_to_try)
+    for model in discovered:
+        if model in already_tried:
+            continue
+        already_tried.add(model)
+        result, conf = await _try_expansion_model(query, model)
+        if result and conf > best_conf:
+            best_result, best_conf = result, conf
+            logger.warning("Query expansion succeeded via discovered model: %s", model)
 
-    if discovered_triggered:
-        discovered = await _discover_models()
-        already_tried = set(models_to_try)
-        for model in discovered:
-            if model in already_tried:
-                continue
-            already_tried.add(model)
-            result = await _try_expansion_model(query, model, False)
-            if result is not None:
-                logger.warning("Query expansion succeeded via discovered model: %s", model)
-                return result
-
-    return None
+    return best_result, best_conf
 
 
-async def expand_query_for_search(query: str, db) -> str | None:
+async def expand_query_for_search(query: str, db) -> tuple[str | None, int]:
     cached = _expansion_cache.get(query)
     if cached:
         logger.info("Query expansion cache HIT (memory): %r -> %r", query, cached)
-        return cached
+        return cached, 0
 
     result = await db.execute(
         select(QueryExpansionCache).where(QueryExpansionCache.original_query == query)
@@ -191,18 +237,18 @@ async def expand_query_for_search(query: str, db) -> str | None:
     if row:
         _expansion_cache[query] = row.expanded_query
         logger.info("Query expansion cache HIT (db): %r -> %r", query, row.expanded_query)
-        return row.expanded_query
+        return row.expanded_query, getattr(row, 'confidence', 0)
 
     last_error = None
     for attempt in range(1, _MAX_RETRIES + 1):
         try:
-            expanded = await _call_expansion(query)
+            expanded, conf = await _call_expansion(query)
             if expanded:
                 _expansion_cache[query] = expanded
-                db.add(QueryExpansionCache(original_query=query, expanded_query=expanded))
+                db.add(QueryExpansionCache(original_query=query, expanded_query=expanded, confidence=conf))
                 await db.commit()
-                logger.info("Query expanded (attempt %d): %r -> %r", attempt, query, expanded)
-                return expanded
+                logger.info("Query expanded (attempt %d): %r -> %r (confidence=%d)", attempt, query, expanded, conf)
+                return expanded, conf
 
             last_error = "empty or unparseable response"
             logger.warning("Query expansion attempt %d: %s for %r", attempt, last_error, query)
@@ -223,16 +269,12 @@ async def expand_query_for_search(query: str, db) -> str | None:
             await asyncio.sleep(attempt * 1.5)
 
     logger.error("Query expansion FAILED after %d attempts: %s — %r", _MAX_RETRIES, last_error, query)
-    return None
+    return None, 0
 
 async def select_law_article_llm(
     situation: str,
     law_list: list[tuple[int, str, str | None, str]],
 ) -> dict:
-    headers = {"Content-Type": "application/json"}
-    if settings.openai_api_key and settings.openai_api_key != "not-needed":
-        headers["Authorization"] = f"Bearer {settings.openai_api_key}"
-
     laws_text = "\n".join(
         f"{i+1}. {title} (№{num}) [{cat}]" if num else f"{i+1}. {title} [{cat}]"
         for i, (_, title, num, cat) in enumerate(law_list)
@@ -243,46 +285,81 @@ async def select_law_article_llm(
 Список доступных законов РК (выбери ТОЛЬКО из этого списка):
 {laws_text}"""
 
-    models_to_try = [settings.openai_model] + _FALLBACK_MODELS
+    models_to_try = [settings.llm_model] + _FALLBACK_MODELS
+
+    result = None
+    async with httpx.AsyncClient(timeout=settings.openai_timeout, verify=False) as client:
+        payload = _build_payload(
+            messages=[
+                {"role": "system", "content": SELECTION_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.1,
+            max_tokens=512,
+        )
+        try:
+            resp = await client.post(
+                f"{settings.openai_base_url}/chat/completions",
+                json=payload,
+                headers=_build_headers(),
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+            json_match = re.search(r"\{.*\}", content, re.DOTALL)
+            if json_match:
+                obj = json.loads(json_match.group())
+                law_title = obj.get("law_title") or ""
+                article_number = str(obj.get("article_number") or "")
+                confidence = int(obj.get("confidence", 0))
+                reasoning = obj.get("reasoning", "")
+                result = {
+                    "law_title": law_title.strip(),
+                    "article_number": article_number.strip(),
+                    "confidence": min(max(confidence, 0), 100),
+                    "reasoning": reasoning.strip(),
+                }
+        except Exception as e:
+            logger.warning("Law selection auto/auto attempt failed: %s", e)
+
+    if result or settings.llm_model == "auto":
+        return result or {"law_title": "", "article_number": "", "confidence": 0, "reasoning": ""}
 
     for model in models_to_try:
         for attempt in range(2):
             try:
-                async with httpx.AsyncClient(timeout=settings.openai_timeout, verify=False) as client:
-                    payload = {
-                        "model": model,
-                        "messages": [
-                            {"role": "system", "content": SELECTION_SYSTEM_PROMPT},
-                            {"role": "user", "content": prompt},
-                        ],
-                        "temperature": 0.1,
-                        "max_tokens": 512,
+                payload = _build_payload(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": SELECTION_SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.1,
+                    max_tokens=512,
+                )
+
+                resp = await client.post(
+                    f"{settings.openai_base_url}/chat/completions",
+                    json=payload,
+                    headers=_build_headers(),
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                content = data["choices"][0]["message"]["content"]
+
+                json_match = re.search(r"\{.*\}", content, re.DOTALL)
+                if json_match:
+                    obj = json.loads(json_match.group())
+                    law_title = obj.get("law_title") or ""
+                    article_number = str(obj.get("article_number") or "")
+                    confidence = int(obj.get("confidence", 0))
+                    reasoning = obj.get("reasoning", "")
+                    return {
+                        "law_title": law_title.strip(),
+                        "article_number": article_number.strip(),
+                        "confidence": min(max(confidence, 0), 100),
+                        "reasoning": reasoning.strip(),
                     }
-                    if model != settings.openai_model:
-                        payload["provider"] = "auto"
-
-                    resp = await client.post(
-                        f"{settings.openai_base_url}/chat/completions",
-                        json=payload,
-                        headers=headers,
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
-                    content = data["choices"][0]["message"]["content"]
-
-                    json_match = re.search(r"\{.*\}", content, re.DOTALL)
-                    if json_match:
-                        obj = json.loads(json_match.group())
-                        law_title = obj.get("law_title") or ""
-                        article_number = str(obj.get("article_number") or "")
-                        confidence = int(obj.get("confidence", 0))
-                        reasoning = obj.get("reasoning", "")
-                        return {
-                            "law_title": law_title.strip(),
-                            "article_number": article_number.strip(),
-                            "confidence": min(max(confidence, 0), 100),
-                            "reasoning": reasoning.strip(),
-                        }
             except Exception as e:
                 logger.warning("Law selection model %s attempt %d: %s", model, attempt + 1, e)
                 await asyncio.sleep(0.5)
@@ -295,11 +372,7 @@ async def generate_control_question(
     law_title: str,
     article_number: str,
     article_content: str,
-) -> str:
-    headers = {"Content-Type": "application/json"}
-    if settings.openai_api_key and settings.openai_api_key != "not-needed":
-        headers["Authorization"] = f"Bearer {settings.openai_api_key}"
-
+) -> tuple[str, int]:
     prompt = f"""Ситуация пользователя: {situation}
 
 Выбранный закон: {law_title}
@@ -309,19 +382,18 @@ async def generate_control_question(
     for attempt in range(3):
         try:
             async with httpx.AsyncClient(timeout=settings.openai_timeout, verify=False) as client:
-                payload = {
-                    "model": settings.openai_model,
-                    "messages": [
+                payload = _build_payload(
+                    messages=[
                         {"role": "system", "content": CONTROL_QUESTION_PROMPT},
                         {"role": "user", "content": prompt},
                     ],
-                    "temperature": 0.3,
-                    "max_tokens": 256,
-                }
+                    temperature=0.3,
+                    max_tokens=256,
+                )
                 resp = await client.post(
                     f"{settings.openai_base_url}/chat/completions",
                     json=payload,
-                    headers=headers,
+                    headers=_build_headers(),
                 )
                 resp.raise_for_status()
                 data = resp.json()
@@ -331,14 +403,15 @@ async def generate_control_question(
                 if json_match:
                     obj = json.loads(json_match.group())
                     q = obj.get("control_question", "")
+                    conf = min(max(int(obj.get("confidence", 0)), 0), 100)
                     if q:
-                        return q.strip()
+                        return q.strip(), conf
         except Exception as e:
             logger.warning("Control question attempt %d failed: %s", attempt + 1, e)
             if attempt < 2:
                 await asyncio.sleep(1)
 
-    return ""
+    return "", 0
 
 
 EXTRACT_CONDITIONS_PROMPT = """Ты — юридический аналитик РК. Извлеки условия применения данной статьи закона.
@@ -357,10 +430,11 @@ EXTRACT_CONDITIONS_PROMPT = """Ты — юридический аналитик 
       "condition_type": "duration|document|circumstance|status|action|other",
       "is_required": true
     }}
-  ]
+  ],
+  "confidence": 0-100
 }}
 
-Если в статье нет явных условий применения, верни {{"conditions": []}}"""
+Если в статье нет явных условий применения, верни {{"conditions": [], "confidence": 0}}"""
 
 
 COMPLETENESS_CHECK_PROMPT = """Ты — юрист РК. Проверь, достаточно ли деталей в описании ситуации для применения найденных статей закона.
@@ -417,10 +491,6 @@ async def check_completeness(
     situation: str, articles_text: str, client_type: str = "forms",
     progress_callback: CallableProgress | None = None,
 ) -> dict:
-    headers = {"Content-Type": "application/json"}
-    if settings.openai_api_key and settings.openai_api_key != "not-needed":
-        headers["Authorization"] = f"Bearer {settings.openai_api_key}"
-
     prompt = COMPLETENESS_CHECK_PROMPT.format(
         situation=situation,
         articles_with_conditions=articles_text,
@@ -431,7 +501,48 @@ async def check_completeness(
         if progress_callback:
             await progress_callback(msg)
 
-    models_to_try = [settings.openai_model] + _FALLBACK_MODELS
+    async with httpx.AsyncClient(timeout=settings.openai_timeout, verify=False) as client:
+        payload = _build_payload(
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=1024,
+        )
+        try:
+            resp = await client.post(
+                f"{settings.openai_base_url}/chat/completions",
+                json=payload,
+                headers=_build_headers(),
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+            json_match = re.search(r"\{.*\}", content, re.DOTALL)
+            if json_match:
+                obj = json.loads(json_match.group())
+                result = {
+                    "completeness": min(max(int(obj.get("completeness", 0)), 0), 100),
+                    "confidence": min(max(int(obj.get("confidence", 0)), 0), 100),
+                    "clarifying_questions": obj.get("clarifying_questions", []) if isinstance(obj.get("clarifying_questions"), list) else [],
+                    "suggestion": str(obj.get("suggestion", situation)),
+                    "instruction": str(obj.get("instruction", "Отправьте полное описание ситуации одним сообщением, дополнив его ответами на уточняющие вопросы.")),
+                }
+                if _is_consistent_completeness(result["completeness"], result["suggestion"]):
+                    return result
+                await _warn(f"⚠ Неконсистентный ответ LLM: completeness={result['completeness']}, suggestion={result['suggestion']!r} — повтор...")
+        except Exception as e:
+            logger.warning("check_completeness auto/auto attempt failed: %s", e)
+
+    if settings.llm_model == "auto":
+        await _warn("✗ auto-режим не дал ответа, использую резервный")
+        return {
+            "completeness": 100,
+            "confidence": 50,
+            "clarifying_questions": [],
+            "suggestion": "-",
+            "instruction": "-",
+        }
+
+    models_to_try = [settings.llm_model] + _FALLBACK_MODELS
     for model in models_to_try:
         for attempt in range(2):
             try:
@@ -439,19 +550,17 @@ async def check_completeness(
                     await _warn(f"⚠ Модель {model} (попытка {attempt + 1})...")
 
                 async with httpx.AsyncClient(timeout=settings.openai_timeout, verify=False) as client:
-                    payload = {
-                        "model": model,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.1,
-                        "max_tokens": 1024,
-                    }
-                    if model != settings.openai_model:
-                        payload["provider"] = "auto"
+                    payload = _build_payload(
+                        model=model,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.1,
+                        max_tokens=1024,
+                    )
 
                     resp = await client.post(
                         f"{settings.openai_base_url}/chat/completions",
                         json=payload,
-                        headers=headers,
+                        headers=_build_headers(),
                     )
                     resp.raise_for_status()
                     data = resp.json()
@@ -495,34 +604,56 @@ async def check_completeness(
     }
 
 
-async def extract_conditions_from_article(article_title: str, article_content: str) -> list[dict]:
-    headers = {"Content-Type": "application/json"}
-    if settings.openai_api_key and settings.openai_api_key != "not-needed":
-        headers["Authorization"] = f"Bearer {settings.openai_api_key}"
-
+async def extract_conditions_from_article(article_title: str, article_content: str) -> tuple[list[dict], int]:
     prompt = EXTRACT_CONDITIONS_PROMPT.format(
         article_title=article_title or "",
         article_content=article_content[:2000] if article_content else "",
     )
 
-    models_to_try = [settings.openai_model] + _FALLBACK_MODELS
+    async with httpx.AsyncClient(timeout=settings.openai_timeout, verify=False) as client:
+        payload = _build_payload(
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=1024,
+        )
+        try:
+            resp = await client.post(
+                f"{settings.openai_base_url}/chat/completions",
+                json=payload,
+                headers=_build_headers(),
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+            json_match = re.search(r"\{.*\}", content, re.DOTALL)
+            if json_match:
+                obj = json.loads(json_match.group())
+                conditions = obj.get("conditions", [])
+                conf = min(max(int(obj.get("confidence", 0)), 0), 100)
+                if isinstance(conditions, list):
+                    return conditions, conf
+        except Exception as e:
+            logger.warning("extract_conditions auto/auto failed: %s", e)
+
+    if settings.llm_model == "auto":
+        return [], 0
+
+    models_to_try = [settings.llm_model] + _FALLBACK_MODELS
     for model in models_to_try:
         for attempt in range(2):
             try:
                 async with httpx.AsyncClient(timeout=settings.openai_timeout, verify=False) as client:
-                    payload = {
-                        "model": model,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.1,
-                        "max_tokens": 1024,
-                    }
-                    if model != settings.openai_model:
-                        payload["provider"] = "auto"
+                    payload = _build_payload(
+                        model=model,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.1,
+                        max_tokens=1024,
+                    )
 
                     resp = await client.post(
                         f"{settings.openai_base_url}/chat/completions",
                         json=payload,
-                        headers=headers,
+                        headers=_build_headers(),
                     )
                     resp.raise_for_status()
                     data = resp.json()
@@ -532,13 +663,14 @@ async def extract_conditions_from_article(article_title: str, article_content: s
                     if json_match:
                         obj = json.loads(json_match.group())
                         conditions = obj.get("conditions", [])
+                        conf = min(max(int(obj.get("confidence", 0)), 0), 100)
                         if isinstance(conditions, list):
-                            return conditions
+                            return conditions, conf
             except Exception as e:
                 logger.warning("extract_conditions %s attempt %d: %s", model, attempt + 1, e)
                 await asyncio.sleep(0.5)
 
-    return []
+    return [], 0
 
 
 COVE_EXTRACT_PROMPT = """Ты — юрист-аналитик. Из данного юридического заключения выдели все фактические утверждения, которые можно проверить по исходным статьям законов.
@@ -552,7 +684,8 @@ COVE_EXTRACT_PROMPT = """Ты — юрист-аналитик. Из данног
       "question": "Вопрос, который можно проверить по тексту статей",
       "expected": "ДА или НЕТ — какой ответ ожидается в заключении"
     }
-  ]
+  ],
+  "confidence": 0-100
 }
 
 Пример:
@@ -595,10 +728,17 @@ LEGAL_SYSTEM_PROMPT = """Ты — юрист РК. Используй ТОЛЬК
 5. Не пересчитывай МРП (месячный расчётный показатель) в тенге. Указывай суммы и цифры ТОЛЬКО в той форме, в которой они указаны в тексте статьи. Копируй числа дословно.
 6. Не добавляй никаких цифр, сумм и данных, которых нет в тексте предоставленных статей
 
-Формат:
-**Ответ:** ...
-**Что делать:** ...
-**Нормы:** [название закона из списка, статья] — суть"""
+Верни ТОЛЬКО JSON:
+{
+  "analysis": "**Ответ:** ...\n**Что делать:** ...\n**Нормы:** [закон, статья] — суть\n**Контрольный вопрос:** ...",
+  "confidence": 0-100,
+  "control_question": "короткий уточняющий вопрос"
+}
+
+Правила для JSON:
+- analysis содержит полный юридический анализ
+- confidence = насколько ты уверен в ответе
+- control_question = 1 короткий вопрос пользователю"""
 
 
 SELECTION_SYSTEM_PROMPT = """Ты — юрист-эксперт Республики Казахстан.
@@ -624,21 +764,23 @@ CONTROL_QUESTION_PROMPT = """Ты — юрист РК. На основе сит�
 Вопрос должен помочь подтвердить, что эта статья действительно применима к ситуации.
 Верни ТОЛЬКО JSON:
 {
-  "control_question": "твой уточняющий вопрос пользователю"
+  "control_question": "твой уточняющий вопрос пользователю",
+  "confidence": 0-100
 }
 
 Правила:
+- confidence = насколько ты уверен, что вопрос релевантен
 - Вопрос должен быть конкретным и по делу
 - Не добавляй лишнего текста, только JSON"""
 
 
-async def generate_legal_analysis(situation: str, pairs: list) -> str:
+async def generate_legal_analysis(situation: str, pairs: list) -> tuple[str | None, int]:
     if not pairs:
         return (
             "По вашему запросу не найдено конкретных законов. "
             "Рекомендуется проконсультироваться с юристом или "
             "уточнить поисковый запрос."
-        )
+        ), 0
 
     articles_text = _format_articles_for_prompt(pairs)
     all_law_names = "\n".join(f"- {law.title} (№{law.number})" if law.number else f"- {law.title}" for law, _ in pairs)
@@ -648,54 +790,80 @@ async def generate_legal_analysis(situation: str, pairs: list) -> str:
 {all_law_names}
 
 Релевантные статьи из этих законов:
-{articles_text}
-
-После анализа задай 1 короткий уточняющий вопрос пользователю в формате:
-**Контрольный вопрос:** <текст вопроса>"""
+{articles_text}"""
 
     if settings.ai_provider == "openai":
         return await _call_openai(situation, user_prompt, pairs)
     else:
-        return await _call_ollama(situation, user_prompt) or _fallback_analysis(situation, pairs)
+        result = await _call_ollama(situation, user_prompt)
+        if result:
+            return result, 50
+        return _fallback_analysis(situation, pairs), 30
 
 
 def _extract_control_question(analysis: str) -> str | None:
     m = re.search(r'\*\*Контрольный вопрос\*\*:\s*(.+?)(?:\n|$)', analysis, re.IGNORECASE)
     if m:
-        return m.group(1).strip()
+        return m.group(1).strip().lstrip('*').strip()
     m = re.search(r'(?:Контрольный вопрос|Уточняющий вопрос|Вопрос)[:\s]\s*(.+?)(?:\n|$)', analysis, re.IGNORECASE)
     if m:
-        return m.group(1).strip()
+        return m.group(1).strip().lstrip('*').strip()
     return None
 
 
-async def _cove_extract_claims(analysis: str) -> list[dict]:
-    headers = {"Content-Type": "application/json"}
-    if settings.openai_api_key and settings.openai_api_key != "not-needed":
-        headers["Authorization"] = f"Bearer {settings.openai_api_key}"
-
+async def _cove_extract_claims(analysis: str) -> tuple[list[dict], int]:
     prompt = f"""Юридическое заключение:
 {analysis}"""
 
-    models_to_try = [settings.openai_model] + _FALLBACK_MODELS
+    async with httpx.AsyncClient(timeout=settings.openai_timeout, verify=False) as client:
+        payload = _build_payload(
+            messages=[
+                {"role": "system", "content": COVE_EXTRACT_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,
+            max_tokens=512,
+        )
+        try:
+            resp = await client.post(
+                f"{settings.openai_base_url}/chat/completions",
+                json=payload,
+                headers=_build_headers(),
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+            json_match = re.search(r"\{.*\}", content, re.DOTALL)
+            if json_match:
+                obj = json.loads(json_match.group())
+                claims = obj.get("claims", [])
+                conf = min(max(int(obj.get("confidence", 0)), 0), 100)
+                if claims:
+                    return claims, conf
+        except Exception as e:
+            logger.warning("CoVe extract claims auto/auto failed: %s", e)
+
+    if settings.llm_model == "auto":
+        return [], 0
+
+    models_to_try = [settings.llm_model] + _FALLBACK_MODELS
     for model in models_to_try:
         for attempt in range(2):
             try:
                 async with httpx.AsyncClient(timeout=settings.openai_timeout, verify=False) as client:
-                    payload = {
-                        "model": model,
-                        "messages": [
+                    payload = _build_payload(
+                        model=model,
+                        messages=[
                             {"role": "system", "content": COVE_EXTRACT_PROMPT},
                             {"role": "user", "content": prompt},
                         ],
-                        "temperature": 0.0,
-                        "max_tokens": 512,
-                    }
-                    if model != settings.openai_model:
-                        payload["provider"] = "auto"
+                        temperature=0.0,
+                        max_tokens=512,
+                    )
                     resp = await client.post(
                         f"{settings.openai_base_url}/chat/completions",
-                        json=payload, headers=headers,
+                        json=payload,
+                        headers=_build_headers(),
                     )
                     resp.raise_for_status()
                     data = resp.json()
@@ -704,43 +872,71 @@ async def _cove_extract_claims(analysis: str) -> list[dict]:
                     if json_match:
                         obj = json.loads(json_match.group())
                         claims = obj.get("claims", [])
+                        conf = min(max(int(obj.get("confidence", 0)), 0), 100)
                         if claims:
-                            return claims
+                            return claims, conf
             except Exception as e:
                 logger.warning("CoVe extract claims %s attempt %d: %s", model, attempt + 1, e)
                 await asyncio.sleep(0.5)
-    return []
+    return [], 0
 
 
 async def _cove_verify_one(question: str, articles_text: str) -> dict:
-    headers = {"Content-Type": "application/json"}
-    if settings.openai_api_key and settings.openai_api_key != "not-needed":
-        headers["Authorization"] = f"Bearer {settings.openai_api_key}"
-
     prompt = f"""Статьи законов для проверки:
 {articles_text}
 
 Вопрос: {question}"""
 
-    models_to_try = [settings.openai_model] + _FALLBACK_MODELS
+    async with httpx.AsyncClient(timeout=settings.openai_timeout, verify=False) as client:
+        payload = _build_payload(
+            messages=[
+                {"role": "system", "content": COVE_VERIFY_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,
+            max_tokens=256,
+        )
+        try:
+            resp = await client.post(
+                f"{settings.openai_base_url}/chat/completions",
+                json=payload,
+                headers=_build_headers(),
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+            json_match = re.search(r"\{.*\}", content, re.DOTALL)
+            if json_match:
+                obj = json.loads(json_match.group())
+                return {
+                    "answer": obj.get("answer", "НЕТ"),
+                    "evidence": obj.get("evidence"),
+                    "confidence": int(obj.get("confidence", 0)),
+                }
+        except Exception as e:
+            logger.warning("CoVe verify auto/auto failed: %s", e)
+
+    if settings.llm_model == "auto":
+        return {"answer": "НЕТ", "evidence": None, "confidence": 0}
+
+    models_to_try = [settings.llm_model] + _FALLBACK_MODELS
     for model in models_to_try:
         for attempt in range(2):
             try:
                 async with httpx.AsyncClient(timeout=settings.openai_timeout, verify=False) as client:
-                    payload = {
-                        "model": model,
-                        "messages": [
+                    payload = _build_payload(
+                        model=model,
+                        messages=[
                             {"role": "system", "content": COVE_VERIFY_PROMPT},
                             {"role": "user", "content": prompt},
                         ],
-                        "temperature": 0.0,
-                        "max_tokens": 256,
-                    }
-                    if model != settings.openai_model:
-                        payload["provider"] = "auto"
+                        temperature=0.0,
+                        max_tokens=256,
+                    )
                     resp = await client.post(
                         f"{settings.openai_base_url}/chat/completions",
-                        json=payload, headers=headers,
+                        json=payload,
+                        headers=_build_headers(),
                     )
                     resp.raise_for_status()
                     data = resp.json()
@@ -760,10 +956,6 @@ async def _cove_verify_one(question: str, articles_text: str) -> dict:
 
 
 async def _cove_revise(situation: str, analysis: str, verification_log: list[dict], pairs: list) -> tuple[str, int]:
-    headers = {"Content-Type": "application/json"}
-    if settings.openai_api_key and settings.openai_api_key != "not-needed":
-        headers["Authorization"] = f"Bearer {settings.openai_api_key}"
-
     log_text = "\n".join(
         f"Утверждение: {v.get('question', '')}\nПроверка: {v.get('answer', 'НЕТ')}\nДоказательство: {v.get('evidence', 'нет')}\n"
         for v in verification_log
@@ -788,25 +980,50 @@ async def _cove_revise(situation: str, analysis: str, verification_log: list[dic
 
 Исправь заключение: убери ошибочные утверждения, оставь только подтверждённые факты."""
 
-    models_to_try = [settings.openai_model] + _FALLBACK_MODELS
+    async with httpx.AsyncClient(timeout=settings.openai_timeout, verify=False) as client:
+        payload = _build_payload(
+            messages=[
+                {"role": "system", "content": COVE_REVISE_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+            max_tokens=1536,
+        )
+        try:
+            resp = await client.post(
+                f"{settings.openai_base_url}/chat/completions",
+                json=payload,
+                headers=_build_headers(),
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            revised = data["choices"][0]["message"]["content"].strip()
+            if revised and len(revised) > 50:
+                return revised, confidence
+        except Exception as e:
+            logger.warning("CoVe revise auto/auto failed: %s", e)
+
+    if settings.llm_model == "auto":
+        return analysis, confidence
+
+    models_to_try = [settings.llm_model] + _FALLBACK_MODELS
     for model in models_to_try:
         for attempt in range(2):
             try:
                 async with httpx.AsyncClient(timeout=settings.openai_timeout, verify=False) as client:
-                    payload = {
-                        "model": model,
-                        "messages": [
+                    payload = _build_payload(
+                        model=model,
+                        messages=[
                             {"role": "system", "content": COVE_REVISE_PROMPT},
                             {"role": "user", "content": prompt},
                         ],
-                        "temperature": 0.2,
-                        "max_tokens": 1536,
-                    }
-                    if model != settings.openai_model:
-                        payload["provider"] = "auto"
+                        temperature=0.2,
+                        max_tokens=1536,
+                    )
                     resp = await client.post(
                         f"{settings.openai_base_url}/chat/completions",
-                        json=payload, headers=headers,
+                        json=payload,
+                        headers=_build_headers(),
                     )
                     resp.raise_for_status()
                     data = resp.json()
@@ -829,7 +1046,7 @@ async def cove_verify(
 
     articles_text = _format_articles_for_prompt(pairs)
 
-    claims = await _cove_extract_claims(analysis)
+    claims, claims_conf = await _cove_extract_claims(analysis)
     if not claims:
         logger.warning("CoVe: no claims extracted from analysis")
         return {"analysis": analysis, "confidence": 50, "errors": []}
@@ -899,55 +1116,67 @@ def _is_unhelpful(text: str, pairs: list | None = None) -> bool:
 _FALLBACK_MODELS = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile"]
 
 
-async def _try_openai_model(model: str, user_prompt: str, pairs: list | None, use_provider_auto: bool) -> str | None:
+async def _try_openai_model(model: str = "auto", user_prompt: str = "", pairs: list | None = None) -> tuple[str | None, int]:
     try:
-        headers = {"Content-Type": "application/json"}
-        if settings.openai_api_key and settings.openai_api_key != "not-needed":
-            headers["Authorization"] = f"Bearer {settings.openai_api_key}"
-
         full_user = f"{LEGAL_SYSTEM_PROMPT}\n\n{user_prompt}"
         async with httpx.AsyncClient(timeout=settings.openai_timeout, verify=False) as client:
-            payload = {
-                "model": model,
-                "messages": [{"role": "user", "content": full_user}],
-                "temperature": 0.3,
-                "max_tokens": 2048,
-            }
-            if use_provider_auto:
-                payload["provider"] = "auto"
+            payload = _build_payload(
+                model=model,
+                messages=[{"role": "user", "content": full_user}],
+                temperature=0.3,
+                max_tokens=2048,
+            )
 
             resp = await client.post(
                 f"{settings.openai_base_url}/chat/completions",
                 json=payload,
-                headers=headers,
+                headers=_build_headers(),
             )
             resp.raise_for_status()
             result = resp.json()
             msg = result["choices"][0]["message"]
-            analysis = (msg.get("content") or msg.get("reasoning") or "").strip()
-            if analysis and not _is_unhelpful(analysis, pairs):
-                return analysis
-            logger.warning("Model %s (provider=auto=%s) returned unhelpful response%s",
-                          model, use_provider_auto, f" (pairs={len(pairs)})" if pairs else "")
+            content = (msg.get("content") or "").strip()
+            if not content:
+                return None, 0
+
+            json_match = re.search(r"\{.*\}", content, re.DOTALL)
+            if json_match:
+                try:
+                    obj = json.loads(json_match.group())
+                    analysis = obj.get("analysis", "").strip()
+                    conf = min(max(int(obj.get("confidence", 0)), 0), 100)
+                    if analysis and not _is_unhelpful(analysis, pairs):
+                        return analysis, conf
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    pass
+
+            if content and not _is_unhelpful(content, pairs):
+                return content, 50
     except Exception as e:
-        logger.warning("Model %s (provider=auto=%s) failed (%s)", model, use_provider_auto, e)
+        logger.warning("Model %s failed (%s)", model, e)
 
-    return None
+    return None, 0
 
 
-async def _call_openai(situation: str, user_prompt: str, pairs: list | None = None) -> str:
-    models_to_try = [settings.openai_model] + _FALLBACK_MODELS
+async def _call_openai(situation: str, user_prompt: str, pairs: list | None = None) -> tuple[str | None, int]:
+    if settings.llm_model == "auto":
+        result, conf = await _try_openai_model(user_prompt=user_prompt, pairs=pairs)
+        if result:
+            return result, conf
+        return _fallback_analysis(situation, pairs), 30
 
+    best_result = None
+    best_conf = 0
+
+    result, conf = await _try_openai_model(user_prompt=user_prompt, pairs=pairs)
+    if result and conf >= best_conf:
+        best_result, best_conf = result, conf
+
+    models_to_try = [settings.llm_model] + _FALLBACK_MODELS
     for model in models_to_try:
-        result = await _try_openai_model(model, user_prompt, pairs, False)
-        if result is not None:
-            return result
-
-    had_404 = False
-    for model in models_to_try:
-        result = await _try_openai_model(model, user_prompt, pairs, True)
-        if result is not None:
-            return result
+        result, conf = await _try_openai_model(model, user_prompt, pairs)
+        if result and conf > best_conf:
+            best_result, best_conf = result, conf
 
     discovered = await _discover_models()
     already_tried = set(models_to_try)
@@ -955,12 +1184,14 @@ async def _call_openai(situation: str, user_prompt: str, pairs: list | None = No
         if model in already_tried:
             continue
         already_tried.add(model)
-        result = await _try_openai_model(model, user_prompt, pairs, False)
-        if result is not None:
+        result, conf = await _try_openai_model(model, user_prompt, pairs)
+        if result and conf > best_conf:
+            best_result, best_conf = result, conf
             logger.warning("LLM analysis succeeded via discovered model: %s", model)
-            return result
 
-    return _fallback_analysis(situation, pairs)
+    if best_result:
+        return best_result, best_conf
+    return _fallback_analysis(situation, pairs), 30
 
 
 def _format_articles_for_prompt(pairs: list) -> str:

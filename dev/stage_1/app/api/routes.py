@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -97,7 +97,7 @@ async def _get_or_create_conditions(article: Article, db: AsyncSession) -> list[
     if conditions:
         return conditions
 
-    conditions_data = await extract_conditions_from_article(article.title or "", article.content or "")
+    conditions_data, _ = await extract_conditions_from_article(article.title or "", article.content or "")
     if not conditions_data:
         return []
 
@@ -136,6 +136,69 @@ def _format_articles_with_conditions(pairs: list, condition_map: dict[int, list[
                 lines.append(f"    Текст: «{content_preview}…»")
         lines.append("")
     return "\n".join(lines)
+
+
+@router.get("/autocomplete")
+async def autocomplete(
+    q: str = Query(..., min_length=2, max_length=100),
+    limit: int = Query(10, le=20),
+    db: AsyncSession = Depends(get_db),
+):
+    pattern = f"%{q.lower()}%"
+    suggestions = []
+
+    laws = await db.execute(
+        select(Law).where(func.lower(Law.title).like(pattern)).limit(limit)
+    )
+    for law in laws.scalars():
+        suggestions.append({
+            "type": "law",
+            "text": law.title,
+            "number": law.number or "",
+            "law_id": law.id,
+            "article_id": None,
+        })
+
+    articles = await db.execute(
+        select(Article).options(selectinload(Article.law))
+        .where(func.lower(Article.title).like(pattern))
+        .limit(limit)
+    )
+    for art in articles.scalars():
+        law_title = art.law.title if art.law else ""
+        suggestions.append({
+            "type": "article",
+            "text": f"{law_title} — Ст. {art.number or '?'}: {art.title}",
+            "number": art.number or "",
+            "law_id": art.law_id,
+            "article_id": art.id,
+        })
+
+    if len(suggestions) < limit:
+        remaining = limit - len(suggestions)
+        content_articles = await db.execute(
+            select(Article).options(selectinload(Article.law))
+            .where(func.lower(Article.content).like(pattern))
+            .limit(remaining)
+        )
+        seen_ids = {s.get("article_id") for s in suggestions if s.get("article_id")}
+        for art in content_articles.scalars():
+            if art.id in seen_ids:
+                continue
+            seen_ids.add(art.id)
+            preview = art.content[:120].replace("\n", " ").strip() if art.content else ""
+            law_title = art.law.title if art.law else ""
+            suggestions.append({
+                "type": "content",
+                "text": f"{law_title} — Ст. {art.number or '?'}: {preview}…",
+                "number": art.number or "",
+                "law_id": art.law_id,
+                "article_id": art.id,
+            })
+            if len(suggestions) >= limit:
+                break
+
+    return suggestions[:limit]
 
 
 @router.get("/categories", response_model=list[CategoryTree])
@@ -266,8 +329,10 @@ async def legal_advice(
 
     pairs = None
     expanded_query = None
+    expanded_confidence = 0
     llm_selection = None
     confidence = 0
+    confidences: list[int] = []
 
     if req.search_method == "llm":
         laws_result = await service.db.execute(
@@ -321,8 +386,9 @@ async def legal_advice(
             pairs = await service.find_relevant_articles(search_text)
 
             if not pairs and req.search_method == "auto":
-                expanded_query = await expand_query_for_search(search_text, service.db)
+                expanded_query, expanded_confidence = await expand_query_for_search(search_text, service.db)
                 if expanded_query:
+                    confidences.append(expanded_confidence)
                     pairs = await service.find_relevant_articles(expanded_query)
 
             if pairs:
@@ -389,16 +455,29 @@ async def legal_advice(
 
     # --- Full analysis (completeness = 100 or no conditions) ---
     control_question = None
-    analysis = await generate_legal_analysis(search_text, pairs)
+    analysis, analysis_confidence = await generate_legal_analysis(search_text, pairs)
+    if analysis_confidence > 0:
+        confidences.append(analysis_confidence)
     if analysis:
         control_question = _extract_control_question(analysis)
 
-    verification = await cove_verify(search_text, analysis, pairs)
+    verification = await cove_verify(search_text, analysis or "", pairs)
     if verification.get("analysis"):
         analysis = verification["analysis"]
         control_question = _extract_control_question(analysis) or control_question
     if verification.get("confidence", 0) > 0:
         confidence = verification["confidence"]
+        confidences.append(confidence)
+
+    # Aggregate confidence: average * multiplier if expansion was weak
+    if confidences:
+        avg_conf = sum(confidences) / len(confidences)
+        if expanded_confidence < 30 and expanded_confidence > 0:
+            multiplier = expanded_confidence / 100.0
+            avg_conf *= multiplier
+        confidence = int(avg_conf)
+    else:
+        confidence = 50
 
     if analysis and confidence > 0:
         analysis = analysis.replace("**Ответ:** ", f"**Ответ:** [{confidence}%] ", 1)
@@ -562,6 +641,8 @@ async def legal_advice_stream(req: LegalAdviceRequest):
 
                 pairs = None
                 expanded_query = None
+                expanded_confidence = 0
+                confidences: list[int] = []
                 confidence = 0
 
                 if req.search_method == "llm":
@@ -608,8 +689,9 @@ async def legal_advice_stream(req: LegalAdviceRequest):
                         pairs = await service.find_relevant_articles(search_text)
                         if not pairs and req.search_method == "auto":
                             yield _sse_progress(20, "Расширение запроса через нейросеть...")
-                            expanded_query = await expand_query_for_search(search_text, db)
+                            expanded_query, expanded_confidence = await expand_query_for_search(search_text, db)
                             if expanded_query:
+                                confidences.append(expanded_confidence)
                                 yield _sse_progress(25, "Повторный поиск...")
                                 pairs = await service.find_relevant_articles(expanded_query)
                         if pairs:
@@ -688,19 +770,28 @@ async def legal_advice_stream(req: LegalAdviceRequest):
                 yield _sse_progress(60, "Применение норм права к ситуации...")
                 yield _sse_progress(63, "Построение правового заключения...")
                 control_question = None
-                analysis = await generate_legal_analysis(search_text, pairs)
+                analysis, analysis_conf = await generate_legal_analysis(search_text, pairs)
+                if analysis_conf > 0:
+                    confidences.append(analysis_conf)
                 if analysis:
                     control_question = _extract_control_question(analysis)
 
                 yield _sse_progress(70, "Запуск самопроверки...")
                 yield _sse_progress(75, "Проверка фактов (самопроверка)...")
                 yield _sse_progress(80, "Поиск контраргументов...")
-                verification = await cove_verify(search_text, analysis, pairs)
+                verification = await cove_verify(search_text, analysis or "", pairs)
                 if verification.get("analysis"):
                     analysis = verification["analysis"]
                     control_question = _extract_control_question(analysis) or control_question
                 if verification.get("confidence", 0) > 0:
-                    confidence = verification["confidence"]
+                    confidences.append(verification["confidence"])
+
+                # Aggregate confidence
+                if confidences:
+                    avg_conf = sum(confidences) / len(confidences)
+                    if expanded_confidence < 30 and expanded_confidence > 0:
+                        avg_conf *= expanded_confidence / 100.0
+                    confidence = int(avg_conf)
 
                 yield _sse_progress(85, "Верификация цитат...")
                 yield _sse_progress(90, "Фильтрация цитированных статей...")

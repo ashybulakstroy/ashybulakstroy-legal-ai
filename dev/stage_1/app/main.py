@@ -6,7 +6,7 @@ from fastapi import FastAPI, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 from jinja2 import Environment, FileSystemLoader
-from sqlalchemy import select, func, case
+from sqlalchemy import select, func, case, text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -38,6 +38,10 @@ async def lifespan(app: FastAPI):
             await conn.execute(sa_text("DROP TABLE IF EXISTS legal_advice_log"))
             logger.info("Migrated legal_advice_log (dropped old schema)")
         await conn.run_sync(Base.metadata.create_all)
+        try:
+            await conn.execute(sa_text("ALTER TABLE query_expansion_cache ADD COLUMN confidence INTEGER DEFAULT 0"))
+        except Exception:
+            pass
     logger.info("Database tables created")
     yield
     await engine.dispose()

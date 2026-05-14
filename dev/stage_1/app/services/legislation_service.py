@@ -1,8 +1,19 @@
+import pymorphy2
+
 from sqlalchemy import select, or_, and_, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.models.legislation import Category, Law, Article, LawStatus
+
+_morph = None
+
+
+def _get_morph() -> pymorphy2.MorphAnalyzer:
+    global _morph
+    if _morph is None:
+        _morph = pymorphy2.MorphAnalyzer()
+    return _morph
 
 _STOP_WORDS = frozenset({
     "и", "в", "не", "на", "с", "по", "от", "за", "о", "для", "до",
@@ -180,6 +191,10 @@ class LegislationService:
         return token[:5] if len(token) >= 5 else token
 
     @staticmethod
+    def _lemmatize(token: str) -> str:
+        return _get_morph().parse(token)[0].normal_form
+
+    @staticmethod
     def _common_prefix_score(token: str, text: str) -> int:
         """Score how well token matches text based on longest common prefix
         with any word in text. Higher = more specific match.
@@ -209,8 +224,17 @@ class LegislationService:
         if not tokens:
             return []
 
+        # Build match keys: both prefix-based and lemma-based
         token_keys = {t: self._match_key(t) for t in tokens}
+        token_lemmas = {}
+        for t in tokens:
+            try:
+                token_lemmas[t] = self._lemmatize(t)
+            except Exception:
+                token_lemmas[t] = t
         strong_tokens = [t for t in tokens if len(t) >= 5] or tokens
+        # Вес токена: чем длиннее, тем специфичнее (меньше шума)
+        token_weights = {t: min(len(t) / 5.0, 3.0) for t in tokens}
 
         stmt = select(Law).options(
             selectinload(Law.category), selectinload(Law.articles)
@@ -231,6 +255,7 @@ class LegislationService:
             # First pass: determine law relevance (token exists anywhere)
             for token in tokens:
                 key = token_keys[token]
+                lemma = token_lemmas[token]
                 ts = self._common_prefix_score(token, title_lower)
                 if ts >= 7:
                     has_title_match = True
@@ -245,10 +270,10 @@ class LegislationService:
                         matched_strong_keys.add(token)
                     continue
 
-                # Check if token exists in any article
+                # Check if token or its lemma exists in any article
                 for article in (law.articles or []):
                     text = ((article.content or "") + " " + (article.title or "")).lower()
-                    if key in text:
+                    if key in text or lemma in text:
                         matched_tokens.add(token)
                         if len(token) >= 5:
                             matched_strong_keys.add(token)
@@ -257,39 +282,70 @@ class LegislationService:
             if not matched_tokens:
                 continue
 
-            # Coverage: title match (ts>=7) auto-passes;
-            # short strong-queries (1-2 strong tokens) need ALL strong keys to match;
-            # longer strong-queries need at least 2 strong keys in articles
-            if not has_title_match and strong_tokens:
-                if len(strong_tokens) <= 2:
-                    if len(matched_strong_keys) < len(strong_tokens):
-                        continue
-                elif len(matched_strong_keys) < 2:
-                    continue
-
-            # Second pass: score all articles, take top max_per_law by relevance
+            # Second pass: score articles — only count hits in article TITLES (not body)
             scored_articles = []
+            art_title_hits = 0
+            art_body_hits = 0
             for article in (law.articles or []):
-                title = (article.title or "").lower()
+                art_title_lower = (article.title or "").lower()
+
+                art_title_score = sum(self._common_prefix_score(t, art_title_lower) for t in tokens)
+                has_title_token = any(
+                    self._common_prefix_score(t, art_title_lower) >= 7
+                    for t in tokens
+                )
+
+                if has_title_token:
+                    art_title_hits += 1
+
                 content = (article.content or "").lower()
+                content_matches = sum(
+                    1 for t in tokens
+                    if token_keys[t] in content or token_lemmas[t] in content
+                )
+                if content_matches > 0:
+                    art_body_hits += 1
 
-                title_score = sum(self._common_prefix_score(t, title) for t in tokens)
-                content_matches = sum(1 for t in tokens if token_keys[t] in content)
+                if has_title_token or content_matches >= 2:
+                    scored_articles.append((art_title_score, content_matches, has_title_token, article))
 
-                if title_score >= 5 or content_matches >= 2:
-                    scored_articles.append((title_score + content_matches * 3, article))
+            scored_articles.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            matched_articles = [art for _, _, _, art in scored_articles[:max_per_law]]
 
-            scored_articles.sort(key=lambda x: x[0], reverse=True)
-            matched_articles = [art for _, art in scored_articles[:max_per_law]]
+            # Coverage filter: law must match in title (law name) OR at least one article title
+            if not has_title_match and art_title_hits == 0:
+                continue
 
-            # Score: title common-prefix, category common-prefix, articles, distinct token coverage
-            title_bonus = sum(self._common_prefix_score(t, title_lower) for t in tokens)
-            cat_bonus = sum(self._common_prefix_score(t, cat_lower) for t in tokens) if cat_lower else 0
-            article_bonus = len(matched_articles) * 2
-            token_coverage_bonus = len(matched_tokens) * 3
-            score = title_bonus + cat_bonus + article_bonus + token_coverage_bonus
+            # Score with differentiated weights + token specificity
+            title_bonus = sum(self._common_prefix_score(t, title_lower) * token_weights[t] for t in tokens)
+            cat_bonus = sum(self._common_prefix_score(t, cat_lower) * token_weights[t] for t in tokens) if cat_lower else 0
 
+            # Weight article title hits by specificity of matching tokens
+            weighted_title_hits = 0
+            for article in (law.articles or []):
+                art_title_lower = (article.title or "").lower()
+                w = sum(token_weights[t] for t in tokens if self._common_prefix_score(t, art_title_lower) >= 7)
+                if w > 0:
+                    weighted_title_hits += w
+
+            score = (
+                title_bonus * 15 +
+                cat_bonus * 5 +
+                weighted_title_hits * 10 +
+                min(art_body_hits, max_per_law) * 1 +
+                sum(token_weights[t] for t in matched_tokens) * 2
+            )
             scored_pairs.append((score, law, matched_articles))
 
         scored_pairs.sort(key=lambda x: (x[0], len(x[2])), reverse=True)
+
+        # Динамический порог: отсекаем законы со скором ниже 40% от максимального
+        if scored_pairs:
+            max_score = scored_pairs[0][0]
+            threshold = max(max_score * 0.4, 1.0)
+            filtered = [(s, law, arts) for s, law, arts in scored_pairs if s >= threshold]
+            if not filtered:
+                filtered = scored_pairs[:1]
+            scored_pairs = filtered
+
         return [(law, arts) for _, law, arts in scored_pairs[:total_limit]]

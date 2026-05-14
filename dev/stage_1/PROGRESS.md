@@ -34,5 +34,5 @@
 - `meta-llama/llama-4-scout-17b-16e-instruct`
 
 ## Остаётся
-- **Скорость**: primary модель `openai/gpt-oss-20b` даёт ~30-40с ответ. Fallback `llama-3.1-8b-instant` работает за 1-5с. Можно сменить `OPENAI_MODEL` в `.env`
+- **Скорость**: primary модель `openai/gpt-oss-20b` даёт ~30-40с ответ. Fallback `llama-3.1-8b-instant` работает за 1-5с. Можно сменить `LLM_MODEL` в `.env`
 - **Healthcheck** перед discovery (опционально)
